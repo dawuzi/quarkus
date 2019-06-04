@@ -17,10 +17,12 @@
 package io.quarkus.runtime.logging;
 
 import java.io.File;
+import java.util.Optional;
 import java.util.logging.Level;
 
 import io.quarkus.runtime.annotations.ConfigGroup;
 import io.quarkus.runtime.annotations.ConfigItem;
+import io.quarkus.runtime.configuration.MemorySize;
 
 @ConfigGroup
 public class FileConfig {
@@ -28,7 +30,7 @@ public class FileConfig {
     /**
      * If file logging should be enabled
      */
-    @ConfigItem(defaultValue = "true")
+    @ConfigItem
     boolean enable;
 
     /**
@@ -49,4 +51,42 @@ public class FileConfig {
     @ConfigItem(defaultValue = "quarkus.log")
     File path;
 
+    /**
+     * File async logging config
+     */
+    AsyncConfig async;
+
+    /**
+     * File rotation config
+     */
+    RotationConfig rotation;
+
+    @ConfigGroup
+    public static class RotationConfig {
+        /**
+         * The maximum file size of the log file after which a rotation is executed.
+         */
+        @ConfigItem
+        Optional<MemorySize> maxFileSize;
+
+        /**
+         * The maximum number of backups to keep.
+         */
+        @ConfigItem(defaultValue = "1")
+        int maxBackupIndex;
+
+        /**
+         * File handler rotation file suffix.
+         *
+         * Example fileSuffix: .yyyy-MM-dd
+         */
+        @ConfigItem
+        Optional<String> fileSuffix;
+
+        /**
+         * Indicates whether to rotate log files on server initialization.
+         */
+        @ConfigItem(defaultValue = "true")
+        boolean rotateOnBoot;
+    }
 }

@@ -21,16 +21,20 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.ListIterator;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
-
 import org.jboss.jandex.AnnotationInstance;
 import org.jboss.jandex.AnnotationTarget;
 import org.jboss.jandex.AnnotationTarget.Kind;
+import org.jboss.jandex.ClassInfo;
+import org.jboss.jandex.DotName;
 import org.jboss.jandex.FieldInfo;
 import org.jboss.jandex.MethodInfo;
+import org.jboss.jandex.ParameterizedType;
 import org.jboss.jandex.Type;
+import org.jboss.jandex.TypeVariable;
 
 /**
  * Represents an injection point.
@@ -39,31 +43,39 @@ import org.jboss.jandex.Type;
  */
 public class InjectionPointInfo {
 
-    static InjectionPointInfo fromField(FieldInfo field, BeanDeployment beanDeployment) {
+    static InjectionPointInfo fromField(FieldInfo field, ClassInfo beanClass, BeanDeployment beanDeployment,
+            InjectionPointModifier transformer) {
         Set<AnnotationInstance> qualifiers = new HashSet<>();
         for (AnnotationInstance annotation : beanDeployment.getAnnotations(field)) {
             if (beanDeployment.getQualifier(annotation.name()) != null) {
                 qualifiers.add(annotation);
             }
         }
-        return new InjectionPointInfo(field.type(), qualifiers.isEmpty() ? Collections.emptySet() : qualifiers, field, -1);
+        Type type = resolveType(field.type(), beanClass, field.declaringClass(), beanDeployment);
+        return new InjectionPointInfo(type,
+                transformer.applyTransformers(type, field, qualifiers), field, -1);
     }
 
-    static InjectionPointInfo fromResourceField(FieldInfo field, BeanDeployment beanDeployment) {
-        return new InjectionPointInfo(field.type(), new HashSet<>(field.annotations()), InjtetionPointKind.RESOURCE, field, -1);
+    static InjectionPointInfo fromResourceField(FieldInfo field, ClassInfo beanClass, BeanDeployment beanDeployment,
+            InjectionPointModifier transformer) {
+        Type type = resolveType(field.type(), beanClass, field.declaringClass(), beanDeployment);
+        return new InjectionPointInfo(type,
+                transformer.applyTransformers(type, field, new HashSet<>(field.annotations())),
+                InjectionPointKind.RESOURCE, field, -1);
     }
 
-    static List<InjectionPointInfo> fromMethod(MethodInfo method, BeanDeployment beanDeployment) {
-        return fromMethod(method, beanDeployment, null);
+    static List<InjectionPointInfo> fromMethod(MethodInfo method, ClassInfo beanClass, BeanDeployment beanDeployment,
+            InjectionPointModifier transformer) {
+        return fromMethod(method, beanClass, beanDeployment, null, transformer);
     }
 
-    static List<InjectionPointInfo> fromMethod(MethodInfo method, BeanDeployment beanDeployment,
-            Predicate<Set<AnnotationInstance>> skipPredicate) {
+    static List<InjectionPointInfo> fromMethod(MethodInfo method, ClassInfo beanClass, BeanDeployment beanDeployment,
+            Predicate<Set<AnnotationInstance>> skipPredicate, InjectionPointModifier transformer) {
         List<InjectionPointInfo> injectionPoints = new ArrayList<>();
         for (ListIterator<Type> iterator = method.parameters().listIterator(); iterator.hasNext();) {
             Type paramType = iterator.next();
             int position = iterator.previousIndex();
-            Set<AnnotationInstance> paramAnnotations = getParameterAnnotations(beanDeployment, method, position);
+            Set<AnnotationInstance> paramAnnotations = Annotations.getParameterAnnotations(beanDeployment, method, position);
             if (skipPredicate != null && skipPredicate.test(paramAnnotations)) {
                 // Skip parameter, e.g. @Disposes
                 continue;
@@ -74,41 +86,35 @@ public class InjectionPointInfo {
                     paramQualifiers.add(paramAnnotation);
                 }
             }
-            injectionPoints.add(new InjectionPointInfo(paramType, paramQualifiers, method, position));
+            Type type = resolveType(paramType, beanClass, method.declaringClass(), beanDeployment);
+            injectionPoints.add(new InjectionPointInfo(type,
+                    transformer.applyTransformers(type, method, paramQualifiers),
+                    method, position));
         }
         return injectionPoints;
     }
 
-    static Set<AnnotationInstance> getParameterAnnotations(BeanDeployment beanDeployment, MethodInfo method, int position) {
-        Set<AnnotationInstance> annotations = new HashSet<>();
-        for (AnnotationInstance annotation : beanDeployment.getAnnotations(method)) {
-            if (Kind.METHOD_PARAMETER.equals(annotation.target().kind())
-                    && annotation.target().asMethodParameter().position() == position) {
-                annotations.add(annotation);
-            }
-        }
-        return annotations;
-    }
-    
     private final TypeAndQualifiers typeAndQualifiers;
 
     private final AtomicReference<BeanInfo> resolvedBean;
 
-    private final InjtetionPointKind kind;
-    
+    private final InjectionPointKind kind;
+
     private final boolean hasDefaultedQualifier;
-    
+
     private final AnnotationTarget target;
-    
+
     private final int position;
 
     InjectionPointInfo(Type requiredType, Set<AnnotationInstance> requiredQualifiers, AnnotationTarget target, int position) {
-        this(requiredType, requiredQualifiers, InjtetionPointKind.CDI, target, position);
+        this(requiredType, requiredQualifiers, InjectionPointKind.CDI, target, position);
     }
 
-    InjectionPointInfo(Type requiredType, Set<AnnotationInstance> requiredQualifiers, InjtetionPointKind kind, AnnotationTarget target, int position) {
+    InjectionPointInfo(Type requiredType, Set<AnnotationInstance> requiredQualifiers, InjectionPointKind kind,
+            AnnotationTarget target, int position) {
         this.typeAndQualifiers = new TypeAndQualifiers(requiredType,
-                requiredQualifiers.isEmpty() ? Collections.singleton(AnnotationInstance.create(DotNames.DEFAULT, null, Collections.emptyList()))
+                requiredQualifiers.isEmpty()
+                        ? Collections.singleton(AnnotationInstance.create(DotNames.DEFAULT, null, Collections.emptyList()))
                         : requiredQualifiers);
         this.resolvedBean = new AtomicReference<BeanInfo>(null);
         this.kind = kind;
@@ -125,7 +131,7 @@ public class InjectionPointInfo {
         return resolvedBean.get();
     }
 
-    InjtetionPointKind getKind() {
+    InjectionPointKind getKind() {
         return kind;
     }
 
@@ -137,14 +143,23 @@ public class InjectionPointInfo {
         return typeAndQualifiers.qualifiers;
     }
 
+    public AnnotationInstance getRequiredQualifier(DotName name) {
+        for (AnnotationInstance qualifier : typeAndQualifiers.qualifiers) {
+            if (qualifier.name().equals(name)) {
+                return qualifier;
+            }
+        }
+        return null;
+    }
+
     public boolean hasDefaultedQualifier() {
         return hasDefaultedQualifier;
     }
-    
+
     TypeAndQualifiers getTypeAndQualifiers() {
         return typeAndQualifiers;
     }
-    
+
     /**
      * For injected params, this method returns the corresponding method and not the param itself.
      * 
@@ -153,7 +168,15 @@ public class InjectionPointInfo {
     public AnnotationTarget getTarget() {
         return target;
     }
-    
+
+    public boolean isField() {
+        return target.kind() == Kind.FIELD;
+    }
+
+    public boolean isParam() {
+        return target.kind() == Kind.METHOD;
+    }
+
     /**
      * @return the parameter position or {@code -1} for a field injection point
      */
@@ -164,9 +187,9 @@ public class InjectionPointInfo {
     public String getTargetInfo() {
         switch (target.kind()) {
             case FIELD:
-                return target.asField().declaringClass().name() + "#" + target.asField().name(); 
+                return target.asField().declaringClass().name() + "#" + target.asField().name();
             case METHOD:
-                return target.asMethod().declaringClass().name() + "#" + target.asMethod().name() + "()"; 
+                return target.asMethod().declaringClass().name() + "#" + target.asMethod().name() + "()";
             default:
                 return target.toString();
         }
@@ -174,11 +197,44 @@ public class InjectionPointInfo {
 
     @Override
     public String toString() {
-        return "InjectionPointInfo [requiredType=" + typeAndQualifiers.type + ", requiredQualifiers=" + typeAndQualifiers.qualifiers + "]";
+        return "InjectionPointInfo [requiredType=" + typeAndQualifiers.type + ", requiredQualifiers="
+                + typeAndQualifiers.qualifiers + "]";
     }
 
-    enum InjtetionPointKind {
-        CDI, RESOURCE
+    private static Type resolveType(Type type, ClassInfo beanClass, ClassInfo declaringClass, BeanDeployment beanDeployment) {
+        if (type.kind() == org.jboss.jandex.Type.Kind.CLASS) {
+            return type;
+        }
+        Map<ClassInfo, Map<TypeVariable, Type>> resolvedTypeVariables = Types.resolvedTypeVariables(beanClass, beanDeployment);
+        return resolveType(type, declaringClass, beanDeployment, resolvedTypeVariables);
+    }
+
+    private static Type resolveType(Type type, ClassInfo beanClass, BeanDeployment beanDeployment,
+            Map<ClassInfo, Map<TypeVariable, Type>> resolvedTypeVariables) {
+        if (type.kind() == org.jboss.jandex.Type.Kind.TYPE_VARIABLE) {
+            if (resolvedTypeVariables.containsKey(beanClass)) {
+                return resolvedTypeVariables.get(beanClass).getOrDefault(type.asTypeVariable(), type);
+            }
+        } else if (type.kind() == org.jboss.jandex.Type.Kind.PARAMETERIZED_TYPE) {
+            ParameterizedType parameterizedType = type.asParameterizedType();
+            Type[] typeParams = new Type[parameterizedType.arguments().size()];
+            for (int i = 0; i < typeParams.length; i++) {
+                Type argument = parameterizedType.arguments().get(i);
+                if (argument.kind() == org.jboss.jandex.Type.Kind.TYPE_VARIABLE
+                        || argument.kind() == org.jboss.jandex.Type.Kind.PARAMETERIZED_TYPE) {
+                    typeParams[i] = resolveType(argument, beanClass, beanDeployment, resolvedTypeVariables);
+                } else {
+                    typeParams[i] = argument;
+                }
+            }
+            return ParameterizedType.create(parameterizedType.name(), typeParams, parameterizedType.owner());
+        }
+        return type;
+    }
+
+    enum InjectionPointKind {
+        CDI,
+        RESOURCE
     }
 
     static class TypeAndQualifiers {

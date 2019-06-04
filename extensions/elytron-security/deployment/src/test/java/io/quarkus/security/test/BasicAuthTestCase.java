@@ -22,7 +22,7 @@ public class BasicAuthTestCase {
     static final QuarkusUnitTest config = new QuarkusUnitTest()
             .setArchiveProducer(() -> ShrinkWrap.create(JavaArchive.class)
                     .addClasses(testClasses)
-                    .addAsManifestResource("microprofile-config.properties")
+                    .addAsResource("application.properties")
                     .addAsResource("test-users.properties")
                     .addAsResource("test-roles.properties"));
 
@@ -110,6 +110,14 @@ public class BasicAuthTestCase {
     public void testJaxrsUserRoleSuccess() {
         RestAssured.given().auth().preemptive().basic("scott", "jb0ss")
                 .when().get("/jaxrs-secured/subject/secured").then()
+                .statusCode(200)
+                .body(equalTo("scott"));
+    }
+
+    @Test
+    public void testJaxrsInjectedPrincipalSuccess() {
+        RestAssured.given().auth().preemptive().basic("scott", "jb0ss")
+                .when().get("/jaxrs-secured/subject/principalSecured").then()
                 .statusCode(200)
                 .body(equalTo("scott"));
     }

@@ -24,6 +24,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URL;
+import java.net.URLClassLoader;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Enumeration;
@@ -31,6 +32,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.function.BiFunction;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
 
 import org.junit.jupiter.api.extension.AfterEachCallback;
 import org.junit.jupiter.api.extension.BeforeAllCallback;
@@ -39,50 +42,44 @@ import org.junit.jupiter.api.extension.ExtensionContext;
 import org.junit.jupiter.api.extension.TestInstanceFactory;
 import org.junit.jupiter.api.extension.TestInstanceFactoryContext;
 import org.junit.jupiter.api.extension.TestInstantiationException;
+import org.junit.platform.commons.JUnitException;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.ClassWriter;
+import org.opentest4j.TestAbortedException;
 
+import io.quarkus.bootstrap.BootstrapClassLoaderFactory;
+import io.quarkus.bootstrap.BootstrapException;
+import io.quarkus.bootstrap.util.PropertyUtils;
+import io.quarkus.builder.BuildChainBuilder;
+import io.quarkus.builder.BuildContext;
+import io.quarkus.builder.BuildStep;
 import io.quarkus.deployment.ClassOutput;
 import io.quarkus.deployment.QuarkusClassWriter;
+import io.quarkus.deployment.builditem.TestAnnotationBuildItem;
+import io.quarkus.deployment.builditem.TestClassPredicateBuildItem;
 import io.quarkus.deployment.util.IoUtil;
 import io.quarkus.runner.RuntimeRunner;
 import io.quarkus.runner.TransformerTarget;
 import io.quarkus.runtime.LaunchMode;
 import io.quarkus.test.common.NativeImageLauncher;
+import io.quarkus.test.common.PathTestHelper;
+import io.quarkus.test.common.PropertyTestUtil;
 import io.quarkus.test.common.RestAssuredURLManager;
 import io.quarkus.test.common.TestInjectionManager;
+import io.quarkus.test.common.TestInstantiator;
 import io.quarkus.test.common.TestResourceManager;
+import io.quarkus.test.common.TestScopeManager;
 import io.quarkus.test.common.http.TestHTTPResourceManager;
 
-public class QuarkusTestExtension implements BeforeAllCallback, BeforeEachCallback, AfterEachCallback, TestInstanceFactory {
+public class QuarkusTestExtension
+        implements BeforeEachCallback, AfterEachCallback, TestInstanceFactory, BeforeAllCallback {
 
-    @Override
-    public void beforeAll(ExtensionContext context) throws Exception {
-        ExtensionContext root = context.getRoot();
-        ExtensionContext.Store store = root.getStore(ExtensionContext.Namespace.GLOBAL);
-        ExtensionState state = (ExtensionState) store.get(ExtensionState.class.getName());
-        System.setProperty("quarkus.log.file.path", "target/quarkus.log");
-        boolean substrateTest = context.getRequiredTestClass().isAnnotationPresent(SubstrateTest.class);
-        if (state == null) {
-            TestResourceManager testResourceManager = new TestResourceManager(context.getRequiredTestClass());
-            testResourceManager.start();
+    private URLClassLoader appCl;
+    private ClassLoader originalCl;
+    private static boolean failedBoot;
 
-            if (substrateTest) {
-                NativeImageLauncher launcher = new NativeImageLauncher(context.getRequiredTestClass());
-                launcher.start();
-                state = new ExtensionState(testResourceManager, launcher, true);
-            } else {
-                state = doJavaStart(context, testResourceManager);
-            }
-            store.put(ExtensionState.class.getName(), state);
-        } else {
-            if (substrateTest != state.isSubstrate()) {
-                throw new RuntimeException(
-                        "Attempted to mix @SubstrateTest and JVM mode tests in the same test run. This is not allowed.");
-            }
-        }
-    }
+    private final RestAssuredURLManager restAssuredURLManager = new RestAssuredURLManager(false);
 
     private ExtensionState doJavaStart(ExtensionContext context, TestResourceManager testResourceManager) {
 
@@ -90,10 +87,27 @@ public class QuarkusTestExtension implements BeforeAllCallback, BeforeEachCallba
 
         Path appClassLocation = getAppClassLocation(context.getRequiredTestClass());
         Path testClassLocation = getTestClassesLocation(context.getRequiredTestClass());
+        ClassLoader testClassLoader = context.getRequiredTestClass().getClassLoader();
+
+        try {
+            appCl = BootstrapClassLoaderFactory.newInstance()
+                    .setAppClasses(appClassLocation)
+                    .setParent(getClass().getClassLoader())
+                    .setOffline(PropertyUtils.getBooleanOrNull(BootstrapClassLoaderFactory.PROP_OFFLINE))
+                    .setLocalProjectsDiscovery(
+                            PropertyUtils.getBoolean(BootstrapClassLoaderFactory.PROP_WS_DISCOVERY, true))
+                    .setEnableClasspathCache(PropertyUtils.getBoolean(BootstrapClassLoaderFactory.PROP_CP_CACHE, true))
+                    .newDeploymentClassLoader();
+        } catch (BootstrapException e) {
+            throw new IllegalStateException("Failed to create the boostrap class loader", e);
+        }
+        originalCl = setCCL(appCl);
+
         RuntimeRunner runtimeRunner = RuntimeRunner.builder()
                 .setLaunchMode(LaunchMode.TEST)
-                .setClassLoader(getClass().getClassLoader())
+                .setClassLoader(appCl)
                 .setTarget(appClassLocation)
+                .addAdditionalArchive(testClassLocation)
                 .setClassOutput(new ClassOutput() {
                     @Override
                     public void writeClass(boolean applicationClass, String className, byte[] data) throws IOException {
@@ -117,7 +131,8 @@ public class QuarkusTestExtension implements BeforeAllCallback, BeforeEachCallba
                 })
                 .setTransformerTarget(new TransformerTarget() {
                     @Override
-                    public void setTransformers(Map<String, List<BiFunction<String, ClassVisitor, ClassVisitor>>> functions) {
+                    public void setTransformers(
+                            Map<String, List<BiFunction<String, ClassVisitor, ClassVisitor>>> functions) {
                         ClassLoader main = Thread.currentThread().getContextClassLoader();
 
                         //we need to use a temp class loader, or the old resource location will be cached
@@ -145,7 +160,8 @@ public class QuarkusTestExtension implements BeforeAllCallback, BeforeEachCallba
                                 return main.getResources(name);
                             }
                         };
-                        for (Map.Entry<String, List<BiFunction<String, ClassVisitor, ClassVisitor>>> e : functions.entrySet()) {
+                        for (Map.Entry<String, List<BiFunction<String, ClassVisitor, ClassVisitor>>> e : functions
+                                .entrySet()) {
                             String resourceName = e.getKey().replace('.', '/') + ".class";
                             try (InputStream stream = temp.getResourceAsStream(resourceName)) {
                                 if (stream == null) {
@@ -187,6 +203,35 @@ public class QuarkusTestExtension implements BeforeAllCallback, BeforeEachCallba
                         }
                     }
                 })
+                .addChainCustomizer(new Consumer<BuildChainBuilder>() {
+                    @Override
+                    public void accept(BuildChainBuilder buildChainBuilder) {
+                        buildChainBuilder.addBuildStep(new BuildStep() {
+                            @Override
+                            public void execute(BuildContext context) {
+                                context.produce(new TestClassPredicateBuildItem(new Predicate<String>() {
+                                    @Override
+                                    public boolean test(String className) {
+                                        return PathTestHelper.isTestClass(className, testClassLoader);
+                                    }
+                                }));
+                            }
+                        }).produces(TestClassPredicateBuildItem.class)
+                                .build();
+                    }
+                })
+                .addChainCustomizer(new Consumer<BuildChainBuilder>() {
+                    @Override
+                    public void accept(BuildChainBuilder buildChainBuilder) {
+                        buildChainBuilder.addBuildStep(new BuildStep() {
+                            @Override
+                            public void execute(BuildContext context) {
+                                context.produce(new TestAnnotationBuildItem(QuarkusTest.class.getName()));
+                            }
+                        }).produces(TestAnnotationBuildItem.class)
+                                .build();
+                    }
+                })
                 .build();
         runtimeRunner.run();
 
@@ -214,28 +259,83 @@ public class QuarkusTestExtension implements BeforeAllCallback, BeforeEachCallba
 
     @Override
     public void afterEach(ExtensionContext context) throws Exception {
-        RestAssuredURLManager.clearURL();
+        restAssuredURLManager.clearURL();
+        TestScopeManager.setup();
     }
 
     @Override
     public void beforeEach(ExtensionContext context) throws Exception {
-        RestAssuredURLManager.setURL();
+        restAssuredURLManager.setURL();
+        TestScopeManager.tearDown();
     }
 
     @Override
     public Object createTestInstance(TestInstanceFactoryContext factoryContext, ExtensionContext extensionContext)
             throws TestInstantiationException {
-        try {
-            Object instance = factoryContext.getTestClass().newInstance();
-            TestHTTPResourceManager.inject(instance);
-            TestInjectionManager.inject(instance);
-            return instance;
-        } catch (InstantiationException | IllegalAccessException e) {
-            throw new TestInstantiationException("Failed to create test instance", e);
+        if (failedBoot) {
+            try {
+                return extensionContext.getRequiredTestClass().newInstance();
+            } catch (Exception e) {
+                throw new TestInstantiationException("Boot failed", e);
+            }
+        }
+        ExtensionContext root = extensionContext.getRoot();
+        ExtensionContext.Store store = root.getStore(ExtensionContext.Namespace.GLOBAL);
+        ExtensionState state = store.get(ExtensionState.class.getName(), ExtensionState.class);
+        PropertyTestUtil.setLogFileProperty();
+        boolean substrateTest = extensionContext.getRequiredTestClass().isAnnotationPresent(SubstrateTest.class);
+        if (state == null) {
+            TestResourceManager testResourceManager = new TestResourceManager(extensionContext.getRequiredTestClass());
+            try {
+                Map<String, String> systemProps = testResourceManager.start();
+
+                if (substrateTest) {
+                    NativeImageLauncher launcher = new NativeImageLauncher(extensionContext.getRequiredTestClass());
+                    launcher.addSystemProperties(systemProps);
+                    try {
+                        launcher.start();
+                    } catch (IOException e) {
+                        throw new JUnitException("Quarkus native image start failed, original cause: " + e);
+                    }
+                    state = new ExtensionState(testResourceManager, launcher, true);
+                } else {
+                    state = doJavaStart(extensionContext, testResourceManager);
+                }
+                store.put(ExtensionState.class.getName(), state);
+
+            } catch (RuntimeException e) {
+                testResourceManager.stop();
+                failedBoot = true;
+                throw e;
+            }
+        } else {
+            if (substrateTest != state.isSubstrate()) {
+                throw new RuntimeException(
+                        "Attempted to mix @SubstrateTest and JVM mode tests in the same test run. This is not allowed.");
+            }
+        }
+
+        Object instance = TestInstantiator.instantiateTest(factoryContext.getTestClass());
+        TestHTTPResourceManager.inject(instance);
+        TestInjectionManager.inject(instance);
+        return instance;
+    }
+
+    private static ClassLoader setCCL(ClassLoader cl) {
+        final Thread thread = Thread.currentThread();
+        final ClassLoader original = thread.getContextClassLoader();
+        thread.setContextClassLoader(cl);
+        return original;
+    }
+
+    @Override
+    public void beforeAll(ExtensionContext context) throws Exception {
+        if (failedBoot) {
+            throw new TestAbortedException("Not running test as boot failed");
         }
     }
 
-    static class ExtensionState implements ExtensionContext.Store.CloseableResource {
+    class ExtensionState implements ExtensionContext.Store.CloseableResource {
 
         private final TestResourceManager testResourceManager;
         private final Closeable resource;
@@ -249,8 +349,17 @@ public class QuarkusTestExtension implements BeforeAllCallback, BeforeEachCallba
 
         @Override
         public void close() throws Throwable {
-            resource.close();
             testResourceManager.stop();
+            try {
+                resource.close();
+            } finally {
+                if (QuarkusTestExtension.this.originalCl != null) {
+                    setCCL(QuarkusTestExtension.this.originalCl);
+                }
+            }
+            if (appCl != null) {
+                appCl.close();
+            }
         }
 
         public boolean isSubstrate() {
@@ -268,9 +377,7 @@ public class QuarkusTestExtension implements BeforeAllCallback, BeforeEachCallba
         @Override
         public void run() {
             try {
-                if (Files.exists(path)) {
-                    Files.delete(path);
-                }
+                Files.deleteIfExists(path);
             } catch (IOException e) {
                 e.printStackTrace();
             }

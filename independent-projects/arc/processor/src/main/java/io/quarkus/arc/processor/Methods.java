@@ -25,7 +25,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
-
 import org.jboss.jandex.AnnotationInstance;
 import org.jboss.jandex.ArrayType;
 import org.jboss.jandex.ClassInfo;
@@ -36,9 +35,10 @@ import org.jboss.jandex.ParameterizedType;
 import org.jboss.jandex.Type;
 import org.jboss.jandex.TypeVariable;
 import org.jboss.jandex.WildcardType;
+import org.jboss.logging.Logger;
 
 final class Methods {
-
+    private static final Logger LOGGER = Logger.getLogger(Methods.class);
     // constructor
     public static final String INIT = "<init>";
     // static initializer
@@ -56,8 +56,7 @@ final class Methods {
     private Methods() {
     }
 
-    static void addDelegatingMethods(IndexView index, ClassInfo classInfo, Map<TypeVariable, Type> resolvedTypeParameters,
-            Map<Methods.MethodKey, MethodInfo> methods) {
+    static void addDelegatingMethods(IndexView index, ClassInfo classInfo, Map<Methods.MethodKey, MethodInfo> methods) {
         // TODO support interfaces default methods
         if (classInfo != null) {
             for (MethodInfo method : classInfo.methods()) {
@@ -66,13 +65,14 @@ final class Methods {
                 }
                 methods.computeIfAbsent(new Methods.MethodKey(method), key -> {
                     // If parameterized try to resolve the type variables
-                    Type returnType = resolveType(key.method.returnType(), resolvedTypeParameters);
+                    Type returnType = key.method.returnType();
                     Type[] params = new Type[key.method.parameters().size()];
                     for (int i = 0; i < params.length; i++) {
-                        params[i] = resolveType(key.method.parameters().get(i), resolvedTypeParameters);
+                        params[i] = key.method.parameters().get(i);
                     }
                     List<TypeVariable> typeVariables = key.method.typeParameters();
-                    return MethodInfo.create(classInfo, key.method.name(), params, returnType, key.method.flags(), typeVariables.toArray(new TypeVariable[] {}),
+                    return MethodInfo.create(classInfo, key.method.name(), params, returnType, key.method.flags(),
+                            typeVariables.toArray(new TypeVariable[] {}),
                             key.method.exceptions().toArray(Type.EMPTY_ARRAY));
                 });
             }
@@ -81,29 +81,27 @@ final class Methods {
                 ClassInfo interfaceClassInfo = index.getClassByName(interfaceType.name());
                 if (interfaceClassInfo != null) {
                     Map<TypeVariable, Type> resolved = Collections.emptyMap();
-                    if (org.jboss.jandex.Type.Kind.PARAMETERIZED_TYPE.equals(interfaceType.kind())) {
-                        resolved = Types.buildResolvedMap(interfaceType.asParameterizedType().arguments(), interfaceClassInfo.typeParameters(),
-                                resolvedTypeParameters);
-                    }
-                    addDelegatingMethods(index, interfaceClassInfo, resolved, methods);
+                    addDelegatingMethods(index, interfaceClassInfo, methods);
                 }
             }
             if (classInfo.superClassType() != null) {
                 ClassInfo superClassInfo = index.getClassByName(classInfo.superName());
                 if (superClassInfo != null) {
                     Map<TypeVariable, Type> resolved = Collections.emptyMap();
-                    if (org.jboss.jandex.Type.Kind.PARAMETERIZED_TYPE.equals(classInfo.superClassType().kind())) {
-                        resolved = Types.buildResolvedMap(classInfo.superClassType().asParameterizedType().arguments(), superClassInfo.typeParameters(),
-                                resolvedTypeParameters);
-                    }
-                    addDelegatingMethods(index, superClassInfo, resolved, methods);
+                    addDelegatingMethods(index, superClassInfo, methods);
                 }
             }
         }
     }
 
     private static boolean skipForClientProxy(MethodInfo method) {
-        if (Modifier.isStatic(method.flags()) || Modifier.isFinal(method.flags()) || Modifier.isPrivate(method.flags())) {
+        short flags = method.flags();
+        String className = method.declaringClass().name().toString();
+        if (Modifier.isFinal(flags) && !className.startsWith("java.")) {
+            LOGGER.warn(String.format("Method %s.%s() is final, skipped during generation of corresponding client proxy",
+                    className, method.name()));
+        }
+        if (Modifier.isStatic(flags) || Modifier.isFinal(flags) || Modifier.isPrivate(flags)) {
             return true;
         }
         if (IGNORED_METHODS.contains(method.name())) {
@@ -115,7 +113,8 @@ final class Methods {
         return false;
     }
 
-    static void addInterceptedMethodCandidates(BeanDeployment beanDeployment, ClassInfo classInfo, Map<MethodKey, Set<AnnotationInstance>> candidates,
+    static void addInterceptedMethodCandidates(BeanDeployment beanDeployment, ClassInfo classInfo,
+            Map<MethodKey, Set<AnnotationInstance>> candidates,
             List<AnnotationInstance> classLevelBindings) {
         for (MethodInfo method : classInfo.methods()) {
             if (skipForSubclass(method)) {
@@ -145,7 +144,14 @@ final class Methods {
     }
 
     private static boolean skipForSubclass(MethodInfo method) {
-        if (Modifier.isStatic(method.flags()) || Modifier.isFinal(method.flags())) {
+        short flags = method.flags();
+        String className = method.declaringClass().name().toString();
+        if (Modifier.isFinal(flags) && !className.startsWith("java.")) {
+            LOGGER.warn(
+                    String.format("Method %s.%s() is final, skipped during generation of corresponding intercepted subclass",
+                            className, method.name()));
+        }
+        if (Modifier.isStatic(flags) || Modifier.isFinal(flags)) {
             return true;
         }
         if (IGNORED_METHODS.contains(method.name())) {
@@ -176,7 +182,8 @@ final class Methods {
             case WILDCARD_TYPE:
                 WildcardType wildcardType = type.asWildcardType();
                 return WildcardType.create(
-                        resolveType(wildcardType.superBound() != null ? wildcardType.superBound() : wildcardType.extendsBound(), resolvedTypeParameters),
+                        resolveType(wildcardType.superBound() != null ? wildcardType.superBound() : wildcardType.extendsBound(),
+                                resolvedTypeParameters),
                         wildcardType.superBound() == null);
             case ARRAY:
                 ArrayType arrayType = type.asArrayType();
@@ -196,7 +203,7 @@ final class Methods {
             this.method = method;
             this.name = method.name();
             this.params = new ArrayList<>();
-            for(Type i : method.parameters()) {
+            for (Type i : method.parameters()) {
                 params.add(i.name());
             }
         }

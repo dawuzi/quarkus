@@ -5,7 +5,7 @@ import java.lang.reflect.Method;
 
 import org.eclipse.microprofile.config.spi.Converter;
 
-import io.smallrye.config.SmallRyeConfig;
+import io.smallrye.config.SmallRyeConfigBuilder;
 
 /**
  * A factory to acquire a converter for a given type.
@@ -14,21 +14,33 @@ import io.smallrye.config.SmallRyeConfig;
  */
 @Deprecated
 public final class ConverterFactory {
-    static final Method getConverter;
 
-    static {
+    static final Method getImplicitConverter = accessible(getImplicitConverterMethod());
+    static final Method getConverterType = accessible(getConverterTypeMethod());
+    static final SmallRyeConfigBuilder smallRyeConfigBuilder = new SmallRyeConfigBuilder();
+
+    @SuppressWarnings("unchecked")
+    public static <T> Converter<T> getImplicitConverter(final Class<T> itemClass) {
         try {
-            getConverter = SmallRyeConfig.class.getDeclaredMethod("getConverter", Class.class);
-            getConverter.setAccessible(true);
-        } catch (NoSuchMethodException e) {
+            return (Converter<T>) getImplicitConverter.invoke(null, itemClass);
+        } catch (IllegalAccessException | InvocationTargetException e) {
             throw reflectionFailure(e);
         }
     }
 
+    /**
+     * This method will find what is the generic type of a given {@link Converter}. Currently it works by
+     * reflective invocation of {@link SmallRyeConfigBuilder#getConverterType} method, but later it should
+     * be changed to call it directly, after method from {@link SmallRyeConfigBuilder} becomes public.
+     *
+     * @param <T> the inferred converter type
+     * @param converter the {@link Converter} to get resultant type from
+     * @return Converter resultant type
+     */
     @SuppressWarnings("unchecked")
-    public static <T> Converter<T> getConverter(final SmallRyeConfig smallRyeConfig, final Class<T> itemClass) {
+    public static <T> Class<T> getConverterType(final Converter<T> converter) {
         try {
-            return (Converter<T>) getConverter.invoke(smallRyeConfig, itemClass);
+            return (Class<T>) getConverterType.invoke(smallRyeConfigBuilder, converter.getClass());
         } catch (IllegalAccessException | InvocationTargetException e) {
             throw reflectionFailure(e);
         }
@@ -36,5 +48,30 @@ public final class ConverterFactory {
 
     private static IllegalStateException reflectionFailure(final ReflectiveOperationException e) {
         return new IllegalStateException("Unexpected reflection failure", e);
+    }
+
+    private static Method getImplicitConverterMethod() {
+        try {
+            return Class
+                    .forName("io.smallrye.config.ImplicitConverters")
+                    .getDeclaredMethod("getConverter", Class.class);
+        } catch (NoSuchMethodException | ClassNotFoundException e) {
+            throw reflectionFailure(e);
+        }
+    }
+
+    private static Method getConverterTypeMethod() {
+        try {
+            return Class
+                    .forName("io.smallrye.config.SmallRyeConfigBuilder")
+                    .getDeclaredMethod("getConverterType", Class.class);
+        } catch (NoSuchMethodException | ClassNotFoundException e) {
+            throw reflectionFailure(e);
+        }
+    }
+
+    private static Method accessible(Method method) {
+        method.setAccessible(true);
+        return method;
     }
 }

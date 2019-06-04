@@ -17,18 +17,37 @@
 package io.quarkus.dev;
 
 import java.io.Closeable;
+import java.io.DataInputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.ObjectInputStream;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.LockSupport;
+import java.util.function.Consumer;
+import java.util.logging.Handler;
 
-import org.eclipse.microprofile.config.Config;
 import org.jboss.logging.Logger;
 
+import io.quarkus.builder.BuildChainBuilder;
+import io.quarkus.builder.BuildContext;
+import io.quarkus.builder.BuildStep;
+import io.quarkus.deployment.builditem.ApplicationClassPredicateBuildItem;
+import io.quarkus.deployment.builditem.LiveReloadBuildItem;
 import io.quarkus.runner.RuntimeRunner;
 import io.quarkus.runtime.LaunchMode;
 import io.quarkus.runtime.Timing;
-import io.smallrye.config.PropertiesConfigSource;
+import io.quarkus.runtime.logging.InitialConfigurator;
 import io.smallrye.config.SmallRyeConfigProviderResolver;
 
 /**
@@ -36,6 +55,7 @@ import io.smallrye.config.SmallRyeConfigProviderResolver;
  */
 public class DevModeMain {
 
+    public static final String DEV_MODE_CONTEXT = "META-INF/dev-mode-context.dat";
     private static final Logger log = Logger.getLogger(DevModeMain.class);
 
     private static volatile ClassLoader currentAppClassLoader;
@@ -43,50 +63,54 @@ public class DevModeMain {
     private static File classesRoot;
     private static File wiringDir;
     private static File cacheDir;
+    private static DevModeContext context;
 
-    private static Closeable closeable;
+    private static Closeable runner;
     static volatile Throwable deploymentProblem;
+    static volatile Throwable compileProblem;
     static RuntimeUpdatesProcessor runtimeUpdatesProcessor;
 
-    public static void main(String... args) throws Exception {
+    static final Map<Class<?>, Object> liveReloadContext = new ConcurrentHashMap<>();
 
+    public static void main(String... args) throws Exception {
         Timing.staticInitStarted();
 
+        try (InputStream devModeCp = DevModeMain.class.getClassLoader().getResourceAsStream(DEV_MODE_CONTEXT)) {
+            context = (DevModeContext) new ObjectInputStream(new DataInputStream(devModeCp)).readObject();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+        //propagate system props
+        for (Map.Entry<String, String> i : context.getSystemProperties().entrySet()) {
+            if (!System.getProperties().containsKey(i.getKey())) {
+                System.setProperty(i.getKey(), i.getValue());
+            }
+        }
         //the path that contains the compiled classes
         classesRoot = new File(args[0]);
         wiringDir = new File(args[1]);
         cacheDir = new File(args[2]);
 
-        //first lets look for some config, as it is not on the current class path
-        //and we need to load it to start undertow eagerly
-        File config = new File(classesRoot, "META-INF/microprofile-config.properties");
-        if (config.exists()) {
-            try {
-                Config built = SmallRyeConfigProviderResolver.instance().getBuilder()
-                        .addDefaultSources()
-                        .addDiscoveredConverters()
-                        .addDiscoveredSources()
-                        .withSources(new PropertiesConfigSource(config.toURL())).build();
-                SmallRyeConfigProviderResolver.instance().registerConfig(built, Thread.currentThread().getContextClassLoader());
-            } catch (Exception e) {
-                throw new RuntimeException(e);
-            }
-        }
-
-        runtimeUpdatesProcessor = RuntimeCompilationSetup.setup();
+        runtimeUpdatesProcessor = RuntimeCompilationSetup.setup(context);
         if (runtimeUpdatesProcessor != null) {
-            runtimeUpdatesProcessor.scanForChangedClasses();
+            runtimeUpdatesProcessor.checkForChangedClasses();
         }
         //TODO: we can't handle an exception on startup with hot replacement, as Undertow might not have started
 
-        doStart();
+        doStart(false, Collections.emptySet());
+        if (deploymentProblem != null || compileProblem != null) {
+            log.error("Failed to start Quarkus, attempting to start hot replacement endpoint to recover");
+            if (runtimeUpdatesProcessor != null) {
+                runtimeUpdatesProcessor.startupFailed();
+            }
+        }
         Runtime.getRuntime().addShutdownHook(new Thread(new Runnable() {
             @Override
             public void run() {
                 synchronized (DevModeMain.class) {
-                    if (closeable != null) {
+                    if (runner != null) {
                         try {
-                            closeable.close();
+                            runner.close();
                         } catch (IOException e) {
                             e.printStackTrace();
                         }
@@ -101,9 +125,11 @@ public class DevModeMain {
                 }
             }
         }, "Quarkus Shutdown Thread"));
+
+        LockSupport.park();
     }
 
-    private static synchronized void doStart() {
+    private static synchronized void doStart(boolean liveReload, Set<String> changedResources) {
         try {
             runtimeCl = new URLClassLoader(new URL[] { classesRoot.toURL() }, ClassLoader.getSystemClassLoader());
             currentAppClassLoader = runtimeCl;
@@ -111,15 +137,41 @@ public class DevModeMain {
             //we can potentially throw away this class loader, and reload the app
             try {
                 Thread.currentThread().setContextClassLoader(runtimeCl);
-                RuntimeRunner runner = RuntimeRunner.builder()
+                RuntimeRunner.Builder builder = RuntimeRunner.builder()
                         .setLaunchMode(LaunchMode.DEVELOPMENT)
+                        .setLiveReloadState(new LiveReloadBuildItem(liveReload, changedResources, liveReloadContext))
                         .setClassLoader(runtimeCl)
                         .setTarget(classesRoot.toPath())
                         .setFrameworkClassesPath(wiringDir.toPath())
-                        .setTransformerCache(cacheDir.toPath())
+                        .setTransformerCache(cacheDir.toPath());
+
+                List<Path> addAdditionalHotDeploymentPaths = new ArrayList<>();
+                for (DevModeContext.ModuleInfo i : context.getModules()) {
+                    if (i.getClassesPath() != null) {
+                        Path classesPath = Paths.get(i.getClassesPath());
+                        addAdditionalHotDeploymentPaths.add(classesPath);
+                        builder.addAdditionalHotDeploymentPath(classesPath);
+                    }
+                }
+                // Make it possible to identify wiring classes generated for classes from additional hot deployment paths
+                builder.addChainCustomizer(new Consumer<BuildChainBuilder>() {
+                    @Override
+                    public void accept(BuildChainBuilder buildChainBuilder) {
+                        buildChainBuilder.addBuildStep(new BuildStep() {
+                            @Override
+                            public void execute(BuildContext context) {
+                                context.produce(new ApplicationClassPredicateBuildItem(n -> {
+                                    return getClassInApplicationClassPaths(n, addAdditionalHotDeploymentPaths) != null;
+                                }));
+                            }
+                        }).produces(ApplicationClassPredicateBuildItem.class).build();
+                    }
+                });
+
+                RuntimeRunner runner = builder
                         .build();
                 runner.run();
-                closeable = runner;
+                DevModeMain.runner = runner;
                 deploymentProblem = null;
             } finally {
                 Thread.currentThread().setContextClassLoader(old);
@@ -127,15 +179,20 @@ public class DevModeMain {
         } catch (Throwable t) {
             deploymentProblem = t;
             log.error("Failed to start quarkus", t);
+
+            // if the log handler is not activated, activate it with a default configuration to flush the messages
+            if (!InitialConfigurator.DELAYED_HANDLER.isActivated()) {
+                InitialConfigurator.DELAYED_HANDLER.setHandlers(new Handler[] { InitialConfigurator.createDefaultHandler() });
+            }
         }
     }
 
-    public static synchronized void restartApp() {
-        if (closeable != null) {
+    public static synchronized void restartApp(Set<String> changedResources) {
+        if (runner != null) {
             ClassLoader old = Thread.currentThread().getContextClassLoader();
             Thread.currentThread().setContextClassLoader(runtimeCl);
             try {
-                closeable.close();
+                runner.close();
             } catch (IOException e) {
                 e.printStackTrace();
             } finally {
@@ -143,12 +200,24 @@ public class DevModeMain {
             }
         }
         SmallRyeConfigProviderResolver.instance().releaseConfig(SmallRyeConfigProviderResolver.instance().getConfig());
-        closeable = null;
+        DevModeMain.runner = null;
         Timing.restart();
-        doStart();
+        doStart(true, changedResources);
     }
 
     public static ClassLoader getCurrentAppClassLoader() {
         return currentAppClassLoader;
+    }
+
+    private static Path getClassInApplicationClassPaths(String name, List<Path> addAdditionalHotDeploymentPaths) {
+        final String fileName = name.replace('.', '/') + ".class";
+        Path classLocation;
+        for (Path i : addAdditionalHotDeploymentPaths) {
+            classLocation = i.resolve(fileName);
+            if (Files.exists(classLocation)) {
+                return classLocation;
+            }
+        }
+        return null;
     }
 }

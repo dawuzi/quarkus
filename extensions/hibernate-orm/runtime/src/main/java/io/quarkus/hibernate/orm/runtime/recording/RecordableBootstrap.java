@@ -19,7 +19,6 @@ package io.quarkus.hibernate.orm.runtime.recording;
 import java.io.File;
 import java.net.URL;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -33,7 +32,6 @@ import org.hibernate.boot.registry.StandardServiceRegistry;
 import org.hibernate.boot.registry.StandardServiceRegistryBuilder;
 import org.hibernate.boot.registry.classloading.spi.ClassLoaderService;
 import org.hibernate.boot.registry.internal.StandardServiceRegistryImpl;
-import org.hibernate.cfg.Environment;
 import org.hibernate.engine.config.internal.ConfigurationServiceInitiator;
 import org.hibernate.engine.jdbc.batch.internal.BatchBuilderInitiator;
 import org.hibernate.engine.jdbc.connections.internal.ConnectionProviderInitiator;
@@ -47,7 +45,6 @@ import org.hibernate.engine.transaction.jta.platform.internal.JtaPlatformInitiat
 import org.hibernate.engine.transaction.jta.platform.internal.JtaPlatformResolverInitiator;
 import org.hibernate.event.internal.EntityCopyObserverFactoryInitiator;
 import org.hibernate.hql.internal.QueryTranslatorFactoryInitiator;
-import org.hibernate.id.factory.internal.MutableIdentifierGeneratorFactoryInitiator;
 import org.hibernate.integrator.spi.Integrator;
 import org.hibernate.integrator.spi.IntegratorService;
 import org.hibernate.internal.util.config.ConfigurationHelper;
@@ -67,6 +64,7 @@ import org.hibernate.tool.schema.internal.SchemaManagementToolInitiator;
 import io.quarkus.hibernate.orm.runtime.boot.QuarkusEnvironment;
 import io.quarkus.hibernate.orm.runtime.service.DialectFactoryInitiator;
 import io.quarkus.hibernate.orm.runtime.service.DisabledJMXInitiator;
+import io.quarkus.hibernate.orm.runtime.service.QuarkusMutableIdentifierGeneratorFactoryInitiator;
 import io.quarkus.hibernate.orm.runtime.service.QuarkusRegionFactoryInitiator;
 
 /**
@@ -136,7 +134,9 @@ public final class RecordableBootstrap extends StandardServiceRegistryBuilder {
         serviceInitiators.add(RefCursorSupportInitiator.INSTANCE);
 
         serviceInitiators.add(QueryTranslatorFactoryInitiator.INSTANCE);
-        serviceInitiators.add(MutableIdentifierGeneratorFactoryInitiator.INSTANCE);
+
+        // Custom one! Also, this one has state so can't use the singleton.
+        serviceInitiators.add(new QuarkusMutableIdentifierGeneratorFactoryInitiator());// MutableIdentifierGeneratorFactoryInitiator.INSTANCE);
 
         serviceInitiators.add(JtaPlatformResolverInitiator.INSTANCE);
         serviceInitiators.add(JtaPlatformInitiator.INSTANCE);
@@ -380,6 +380,10 @@ public final class RecordableBootstrap extends StandardServiceRegistryBuilder {
         for (ServiceContributor serviceContributor : serviceContributors) {
             serviceContributor.contribute(this);
         }
+    }
+
+    public List<ProvidedService> getProvidedServices() {
+        return providedServices;
     }
 
     /**

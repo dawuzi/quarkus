@@ -1,10 +1,10 @@
 # Quarkus
 
-[![Build Status](https://dev.azure.com/protean-ci/Quarkus/_apis/build/status/quarkusio.quarkus)](https://dev.azure.com/protean-ci/Quarkus/_build/latest?definitionId=7)
+[![Build Status](https://dev.azure.com/quarkus-ci/quarkus/_apis/build/status/quarkusio.quarkus)](https://dev.azure.com/quarkus-ci/quarkus/_build/latest?definitionId=1)
 
 > Quarkus - Supersonic Subatomic Java
 
-Quarkus is a Cloud Native, Container First framework for writing Java applications.
+Quarkus is a Cloud Native, (Linux) Container First framework for writing Java applications.
 
 * **Container First**: 
 Minimal footprint Java applications optimal for running in containers

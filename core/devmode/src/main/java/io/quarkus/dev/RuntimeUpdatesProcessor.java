@@ -17,120 +17,150 @@
 package io.quarkus.dev;
 
 import static java.util.stream.Collectors.groupingBy;
+import static java.util.stream.Collectors.toList;
 
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import org.jboss.logging.Logger;
 
 import io.quarkus.deployment.devmode.HotReplacementContext;
+import io.quarkus.deployment.devmode.HotReplacementSetup;
 import io.quarkus.runtime.Timing;
 
 public class RuntimeUpdatesProcessor implements HotReplacementContext {
 
-    private final Path classesDir;
-    private final Path sourcesDir;
-    private final Path resourcesDir;
+    private final DevModeContext context;
     private final ClassLoaderCompiler compiler;
     private volatile long lastChange = System.currentTimeMillis();
 
-    private volatile Set<String> configFilePaths = Collections.emptySet();
-    private final Map<String, Long> configFileTimestamps = new ConcurrentHashMap<>();
+    private volatile Set<String> watchedFilePaths = Collections.emptySet();
+    private final Map<Path, Long> watchedFileTimestamps = new ConcurrentHashMap<>();
 
     private static final Logger log = Logger.getLogger(RuntimeUpdatesProcessor.class.getPackage().getName());
+    private final List<Runnable> preScanSteps = new CopyOnWriteArrayList<>();
+    private final List<HotReplacementSetup> hotReplacementSetup = new ArrayList<>();
 
-    public RuntimeUpdatesProcessor(Path classesDir, Path sourcesDir, Path resourcesDir, ClassLoaderCompiler compiler) {
-        this.classesDir = classesDir;
-        this.sourcesDir = sourcesDir;
-        this.resourcesDir = resourcesDir;
+    public RuntimeUpdatesProcessor(DevModeContext context, ClassLoaderCompiler compiler) {
+        this.context = context;
         this.compiler = compiler;
     }
 
     @Override
     public Path getClassesDir() {
-        return classesDir;
+        //TODO: fix all these
+        for (DevModeContext.ModuleInfo i : context.getModules()) {
+            return Paths.get(i.getResourcePath());
+        }
+        return null;
     }
 
     @Override
-    public Path getSourcesDir() {
-        return sourcesDir;
+    public List<Path> getSourcesDir() {
+        return context.getModules().stream().flatMap(m -> m.getSourcePaths().stream()).map(Paths::get).collect(toList());
     }
 
     @Override
-    public Path getResourcesDir() {
-        return resourcesDir;
+    public List<Path> getResourcesDir() {
+        List<Path> ret = new ArrayList<>();
+        for (DevModeContext.ModuleInfo i : context.getModules()) {
+            if (i.getResourcePath() != null) {
+                ret.add(Paths.get(i.getResourcePath()));
+            }
+        }
+        Collections.reverse(ret); //make sure the actual project is before dependencies
+        return ret;
     }
 
     @Override
     public Throwable getDeploymentProblem() {
-        return DevModeMain.deploymentProblem;
+        //we differentiate between these internally, however for the error reporting they are the same
+        return DevModeMain.compileProblem != null ? DevModeMain.compileProblem : DevModeMain.deploymentProblem;
     }
 
-    public void doScan() throws IOException {
+    @Override
+    public boolean doScan(boolean userInitiated) throws IOException {
         final long startNanoseconds = System.nanoTime();
-        final ConcurrentMap<String, byte[]> changedClasses = scanForChangedClasses();
-        if (changedClasses == null)
-            return;
+        for (Runnable i : preScanSteps) {
+            try {
+                i.run();
+            } catch (Throwable t) {
+                log.error("Pre Scan step failed", t);
+            }
+        }
 
-        DevModeMain.restartApp();
-        log.infof("Hot replace total time: %ss ", Timing.convertToBigDecimalSeconds(System.nanoTime() - startNanoseconds));
+        boolean classChanged = checkForChangedClasses();
+        Set<String> configFileChanged = checkForFileChange();
+
+        //if there is a deployment problem we always restart on scan
+        //this is because we can't setup the config file watches
+        //in an ideal world we would just check every resource file for changes, however as everything is already
+        //all broken we just assume the reason that they have refreshed is because they have fixed something
+        //trying to watch all resource files is complex and this is likely a good enough solution for what is already an edge case
+        if (classChanged || !configFileChanged.isEmpty() || (DevModeMain.deploymentProblem != null && userInitiated)) {
+            DevModeMain.restartApp(configFileChanged);
+            log.infof("Hot replace total time: %ss ", Timing.convertToBigDecimalSeconds(System.nanoTime() - startNanoseconds));
+            return true;
+        }
+        return false;
     }
 
-    ConcurrentMap<String, byte[]> scanForChangedClasses() throws IOException {
-        final Set<File> changedSourceFiles;
+    @Override
+    public void addPreScanStep(Runnable runnable) {
+        preScanSteps.add(runnable);
+    }
 
-        if (sourcesDir != null) {
-            try (final Stream<Path> sourcesStream = Files.walk(sourcesDir)) {
-                changedSourceFiles = sourcesStream
-                        .parallel()
-                        .filter(p -> matchingHandledExtension(p).isPresent())
-                        .filter(p -> wasRecentlyModified(p))
-                        .map(Path::toFile)
-                        //Needing a concurrent Set, not many standard options:
-                        .collect(Collectors.toCollection(ConcurrentSkipListSet::new));
+    boolean checkForChangedClasses() throws IOException {
+        boolean hasChanges = false;
+
+        for (DevModeContext.ModuleInfo i : context.getModules()) {
+            for (String sourcePath : i.getSourcePaths()) {
+                final Set<File> changedSourceFiles;
+                try (final Stream<Path> sourcesStream = Files.walk(Paths.get(sourcePath))) {
+                    changedSourceFiles = sourcesStream
+                            .parallel()
+                            .filter(p -> matchingHandledExtension(p).isPresent())
+                            .filter(p -> wasRecentlyModified(p))
+                            .map(Path::toFile)
+                            //Needing a concurrent Set, not many standard options:
+                            .collect(Collectors.toCollection(ConcurrentSkipListSet::new));
+                }
+                if (!changedSourceFiles.isEmpty()) {
+                    log.info("Changed source files detected, recompiling " + changedSourceFiles);
+                    try {
+                        compiler.compile(sourcePath, changedSourceFiles.stream()
+                                .collect(groupingBy(this::getFileExtension, Collectors.toSet())));
+                        hasChanges = true;
+                        DevModeMain.compileProblem = null;
+                    } catch (Exception e) {
+                        DevModeMain.compileProblem = e;
+                        return false;
+                    }
+                }
             }
-        } else {
-            changedSourceFiles = Collections.EMPTY_SET;
-        }
-        if (!changedSourceFiles.isEmpty()) {
-            log.info("Changes source files detected, recompiling " + changedSourceFiles);
-
-            try {
-                compiler.compile(changedSourceFiles.stream()
-                        .collect(groupingBy(this::getFileExtension, Collectors.toSet())));
-            } catch (Exception e) {
-                DevModeMain.deploymentProblem = e;
-                return null;
-            }
-        }
-        final ConcurrentMap<String, byte[]> changedClasses;
-        try (final Stream<Path> classesStream = Files.walk(classesDir)) {
-            changedClasses = classesStream
-                    .parallel()
-                    .filter(p -> p.toString().endsWith(".class"))
-                    .filter(p -> wasRecentlyModified(p))
-                    .collect(Collectors.toConcurrentMap(
-                            p -> pathToClassName(p),
-                            p -> CopyUtils.readFileContentNoIOExceptions(p)));
-        }
-        if (changedClasses.isEmpty() && !checkForConfigFileChange()) {
-            return null;
         }
 
-        lastChange = System.currentTimeMillis();
-        return changedClasses;
+        if (hasChanges) {
+            lastChange = System.currentTimeMillis();
+        }
+
+        return hasChanges;
     }
 
     private Optional<String> matchingHandledExtension(Path p) {
@@ -146,95 +176,103 @@ public class RuntimeUpdatesProcessor implements HotReplacementContext {
         return name.substring(lastIndexOf);
     }
 
-    private boolean checkForConfigFileChange() {
-        boolean ret = false;
-        boolean doCopy = true;
-        Path root = resourcesDir;
-        if (root == null) {
-            root = classesDir;
-            doCopy = false;
-        }
-        for (String i : configFilePaths) {
-            Path config = root.resolve(i);
-            if (Files.exists(config)) {
-                try {
-                    long value = Files.getLastModifiedTime(config).toMillis();
-                    Long existing = configFileTimestamps.get(i);
-                    if (value > existing) {
-                        ret = true;
-                        if (doCopy) {
-                            Path target = classesDir.resolve(i);
-                            byte[] data = CopyUtils.readFileContent(config);
-                            try (FileOutputStream out = new FileOutputStream(target.toFile())) {
-                                out.write(data);
+    private Set<String> checkForFileChange() {
+        Set<String> ret = new HashSet<>();
+        for (DevModeContext.ModuleInfo module : context.getModules()) {
+            boolean doCopy = true;
+            String rootPath = module.getResourcePath();
+            if (rootPath == null) {
+                rootPath = module.getClassesPath();
+                doCopy = false;
+            }
+            if (rootPath == null) {
+                continue;
+            }
+            Path root = Paths.get(rootPath);
+            Path classesDir = Paths.get(module.getClassesPath());
+
+            for (String path : watchedFilePaths) {
+                Path file = root.resolve(path);
+                if (Files.exists(file)) {
+                    try {
+                        long value = Files.getLastModifiedTime(file).toMillis();
+                        Long existing = watchedFileTimestamps.get(file);
+                        if (value > existing) {
+                            ret.add(path);
+                            log.infof("File change detected: %s", file);
+                            if (doCopy) {
+                                Path target = classesDir.resolve(path);
+                                byte[] data = CopyUtils.readFileContent(file);
+                                try (FileOutputStream out = new FileOutputStream(target.toFile())) {
+                                    out.write(data);
+                                }
                             }
+                            watchedFileTimestamps.put(file, value);
                         }
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
                     }
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
+                } else {
+                    watchedFileTimestamps.put(file, 0L);
+                    Path target = classesDir.resolve(path);
+                    try {
+                        Files.deleteIfExists(target);
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
                 }
             }
         }
+
         return ret;
     }
 
     private boolean wasRecentlyModified(final Path p) {
         try {
             long sourceMod = Files.getLastModifiedTime(p).toMillis();
-            boolean recent = sourceMod > lastChange;
-            if (recent) {
-                return true;
-            }
-            Optional<String> matchingExtension = matchingHandledExtension(p);
-            if (matchingExtension.isPresent()) {
-                String pathName = sourcesDir.relativize(p).toString();
-                String classFileName = pathName.substring(0, pathName.length() - matchingExtension.get().length()) + ".class";
-                Path classFile = classesDir.resolve(classFileName);
-                if (!Files.exists(classFile)) {
-                    return true;
-                }
-                return sourceMod > Files.getLastModifiedTime(classFile).toMillis();
-            } else {
-                return false;
-            }
+            return sourceMod > lastChange;
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
     }
 
-    private String pathToClassName(final Path path) {
-        String pathName = classesDir.relativize(path).toString();
-        String className = pathName.substring(0, pathName.length() - 6).replace('/', '.');
-        return className;
-    }
+    public RuntimeUpdatesProcessor setWatchedFilePaths(Set<String> watchedFilePaths) {
+        this.watchedFilePaths = watchedFilePaths;
+        watchedFileTimestamps.clear();
 
-    interface UpdateHandler {
+        for (DevModeContext.ModuleInfo module : context.getModules()) {
+            String rootPath = module.getResourcePath();
 
-        void handle(Map<String, byte[]> changed);
-
-    }
-
-    public RuntimeUpdatesProcessor setConfigFilePaths(Set<String> configFilePaths) {
-        this.configFilePaths = configFilePaths;
-        configFileTimestamps.clear();
-        Path root = resourcesDir;
-        if (root == null) {
-            root = classesDir;
-        }
-        for (String i : configFilePaths) {
-            Path config = root.resolve(i);
-            if (Files.exists(config)) {
-                try {
-                    configFileTimestamps.put(i, Files.getLastModifiedTime(config).toMillis());
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
+            if (rootPath == null) {
+                rootPath = module.getClassesPath();
+            }
+            if (rootPath == null) {
+                continue;
+            }
+            Path root = Paths.get(rootPath);
+            for (String i : watchedFilePaths) {
+                Path config = root.resolve(i);
+                if (Files.exists(config)) {
+                    try {
+                        watchedFileTimestamps.put(config, Files.getLastModifiedTime(config).toMillis());
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                } else {
+                    watchedFileTimestamps.put(config, 0L);
                 }
-            } else {
-                configFileTimestamps.put(i, 0L);
             }
         }
-
         return this;
     }
 
+    public void addHotReplacementSetup(HotReplacementSetup service) {
+        hotReplacementSetup.add(service);
+    }
+
+    public void startupFailed() {
+        for (HotReplacementSetup i : hotReplacementSetup) {
+            i.handleFailedInitialStart();
+        }
+    }
 }

@@ -18,8 +18,8 @@
 package io.quarkus.creator.phase.augment;
 
 import java.nio.file.Path;
-
-import io.quarkus.creator.AppDependency;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * Represents an outcome of {@link AugmentPhase}
@@ -51,13 +51,21 @@ public interface AugmentOutcome {
     Path getWiringClassesDir();
 
     /**
-     * Phases that consume this outcome may check whether an application
-     * dependency was "whitelisted" for processing during augmentation.
-     * <p>
-     * The need for this method has to be further reviewed.
+     * Directory containing config files used by the application
      *
-     * @param dep application dependency
-     * @return true if the dependency was whitelisted, otherwise - false
+     * @return directory containing config files
      */
-    boolean isWhitelisted(AppDependency dep);
+    Path getConfigDir();
+
+    /**
+     * This returns a map of jar files to classes from that jar that have been transformed. These classes should
+     * not be copied into the final output, as they are present in the transformed classes set, so will need to
+     * be removed from the jar file.
+     *
+     * Note that the classes are in file name format (i.e. with / instead of . and with the .class suffix)
+     *
+     * @return the transformed class files
+     */
+    Map<Path, Set<String>> getTransformedClassesByJar();
+
 }

@@ -1,16 +1,24 @@
 package io.quarkus.deployment.devmode;
 
 import java.nio.file.Path;
+import java.util.List;
 
 public interface HotReplacementContext {
 
     Path getClassesDir();
 
-    Path getSourcesDir();
+    List<Path> getSourcesDir();
 
-    Path getResourcesDir();
+    List<Path> getResourcesDir();
 
     Throwable getDeploymentProblem();
 
-    void doScan() throws Exception;
+    /**
+     * 
+     * @return {@code true} if a restart was performed, {@code false} otherwise
+     * @throws Exception
+     */
+    boolean doScan(boolean userInitiated) throws Exception;
+
+    void addPreScanStep(Runnable runnable);
 }

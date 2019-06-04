@@ -1,3 +1,9 @@
+////
+This guide is maintained in the main Quarkus repository
+and pull requests should be submitted there:
+https://github.com/quarkusio/quarkus/tree/master/docs/src/main/asciidoc
+////
+
 include::./attributes.adoc[]
 :experimental:
 
@@ -37,7 +43,7 @@ The solution is located in the `getting-started-knative` directory.
 
 Before we deploy the application to Knative in Minikube or Minishift we need to create the following Kubernetes objects:
 
-- https://github.com/knative/docs/tree/master/serving/samples/build-private-repo-go#creating-a-dockerhub-push-credential[Container registry secrets] :-
+- https://github.com/knative/docs/blob/master/docs/serving/deploying-with-private-registry.md#provide-container-registry-credentials-to-knative[Container registry secrets] :-
 This is required to for the built container image to be pushed to the container registry of your choice
 - https://developer.github.com/v3/guides/managing-deploy-keys/#deploy-keys[Deploy Key] :-
 This is required only if you are going to pull the sources from private repository.
@@ -97,7 +103,7 @@ you need to run the following maven command to make them passed to the Knative r
 
 The following is the example command to generate the need knative resource files
 
-[source,shell, subs="attributes"]
+[source, shell, subs="attributes"]
 ----
 mvn -Dgithub.deploy.key=$(cat ~/.ssh/quarkus-quickstarts | base64 -w 0) \
     -Dgithub.keyscan=$(ssh-keyscan github.com | base64 -w 0) \
@@ -105,11 +111,10 @@ mvn -Dgithub.deploy.key=$(cat ~/.ssh/quarkus-quickstarts | base64 -w 0) \
     -Dcontainer.registry.user='demo' \
     -Dcontainer.registry.password='password' \
     -Dgit.source.revision='master' \
-    -Dgit.source.repo.url='{quickstarts-clone-url}' \ #<1>
+    -Dgit.source.repo.url='{quickstarts-clone-url}' \ # <1>
     -Dapp.container.image='docker.io/demo/getting-started-knative' \
     clean process-resources
 ----
-
 <1> If your are using a private repo then you might need to use git ssh url
 
 The above command will apply the property values to the Knative resources found in `${project.basedir}/src/main/knative`

@@ -22,12 +22,12 @@ import static io.undertow.servlet.api.SecurityInfo.EmptyRoleSemantic.DENY;
 import static io.undertow.servlet.api.SecurityInfo.EmptyRoleSemantic.PERMIT;
 import static javax.servlet.DispatcherType.REQUEST;
 
-import java.io.FileInputStream;
 import java.io.IOException;
-import java.nio.file.Files;
+import java.net.URL;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -38,14 +38,15 @@ import java.util.stream.Collectors;
 
 import javax.annotation.security.DeclareRoles;
 import javax.annotation.security.RunAs;
+import javax.enterprise.context.SessionScoped;
 import javax.inject.Inject;
+import javax.servlet.ServletContainerInitializer;
+import javax.servlet.annotation.HandlesTypes;
 import javax.servlet.annotation.MultipartConfig;
 import javax.servlet.annotation.ServletSecurity;
 import javax.servlet.annotation.WebFilter;
 import javax.servlet.annotation.WebListener;
 import javax.servlet.annotation.WebServlet;
-import javax.xml.stream.XMLInputFactory;
-import javax.xml.stream.XMLStreamReader;
 
 import org.jboss.annotation.javaee.Descriptions;
 import org.jboss.annotation.javaee.DisplayNames;
@@ -56,6 +57,7 @@ import org.jboss.jandex.AnnotationValue;
 import org.jboss.jandex.ClassInfo;
 import org.jboss.jandex.DotName;
 import org.jboss.jandex.IndexView;
+import org.jboss.jandex.Type;
 import org.jboss.metadata.javaee.spec.DescriptionGroupMetaData;
 import org.jboss.metadata.javaee.spec.DescriptionImpl;
 import org.jboss.metadata.javaee.spec.DescriptionsImpl;
@@ -68,9 +70,6 @@ import org.jboss.metadata.javaee.spec.RunAsMetaData;
 import org.jboss.metadata.javaee.spec.SecurityRoleMetaData;
 import org.jboss.metadata.javaee.spec.SecurityRoleRefMetaData;
 import org.jboss.metadata.javaee.spec.SecurityRolesMetaData;
-import org.jboss.metadata.parser.servlet.WebMetaDataParser;
-import org.jboss.metadata.parser.util.MetaDataElementParser;
-import org.jboss.metadata.property.PropertyReplacers;
 import org.jboss.metadata.web.spec.AnnotationMetaData;
 import org.jboss.metadata.web.spec.AnnotationsMetaData;
 import org.jboss.metadata.web.spec.DispatcherType;
@@ -90,29 +89,36 @@ import org.jboss.metadata.web.spec.WebMetaData;
 
 import io.quarkus.arc.deployment.AdditionalBeanBuildItem;
 import io.quarkus.arc.deployment.BeanContainerBuildItem;
-import io.quarkus.deployment.ApplicationArchive;
+import io.quarkus.arc.deployment.ContextRegistrarBuildItem;
+import io.quarkus.arc.processor.ContextRegistrar;
 import io.quarkus.deployment.annotations.BuildProducer;
 import io.quarkus.deployment.annotations.BuildStep;
 import io.quarkus.deployment.annotations.Record;
 import io.quarkus.deployment.builditem.ApplicationArchivesBuildItem;
-import io.quarkus.deployment.builditem.ArchiveRootBuildItem;
 import io.quarkus.deployment.builditem.CombinedIndexBuildItem;
-import io.quarkus.deployment.builditem.HotDeploymentConfigFileBuildItem;
+import io.quarkus.deployment.builditem.ExecutorBuildItem;
+import io.quarkus.deployment.builditem.HotDeploymentWatchedFileBuildItem;
 import io.quarkus.deployment.builditem.LaunchModeBuildItem;
 import io.quarkus.deployment.builditem.ObjectSubstitutionBuildItem;
 import io.quarkus.deployment.builditem.ServiceStartBuildItem;
 import io.quarkus.deployment.builditem.ShutdownContextBuildItem;
 import io.quarkus.deployment.builditem.substrate.ReflectiveClassBuildItem;
+import io.quarkus.deployment.builditem.substrate.RuntimeReinitializedClassBuildItem;
 import io.quarkus.deployment.builditem.substrate.SubstrateConfigBuildItem;
 import io.quarkus.deployment.builditem.substrate.SubstrateResourceBuildItem;
 import io.quarkus.deployment.recording.RecorderContext;
+import io.quarkus.deployment.util.ServiceUtil;
+import io.quarkus.kubernetes.spi.KubernetesPortBuildItem;
 import io.quarkus.runtime.RuntimeValue;
-import io.quarkus.runtime.annotations.ConfigItem;
+import io.quarkus.undertow.runtime.HttpBuildConfig;
 import io.quarkus.undertow.runtime.HttpConfig;
+import io.quarkus.undertow.runtime.HttpSessionContext;
 import io.quarkus.undertow.runtime.ServletProducer;
 import io.quarkus.undertow.runtime.ServletSecurityInfoProxy;
 import io.quarkus.undertow.runtime.ServletSecurityInfoSubstitution;
 import io.quarkus.undertow.runtime.UndertowDeploymentTemplate;
+import io.quarkus.undertow.runtime.UndertowHandlersConfServletExtension;
+import io.quarkus.undertow.runtime.filters.CORSTemplate;
 import io.undertow.Undertow;
 import io.undertow.servlet.api.DeploymentInfo;
 import io.undertow.servlet.api.FilterInfo;
@@ -121,6 +127,7 @@ import io.undertow.servlet.api.ServletInfo;
 import io.undertow.servlet.api.ServletSecurityInfo;
 import io.undertow.servlet.handlers.DefaultServlet;
 
+//TODO: break this up, it is getting too big
 public class UndertowBuildStep {
 
     public static final DotName WEB_FILTER = DotName.createSimple(WebFilter.class.getName());
@@ -130,16 +137,11 @@ public class UndertowBuildStep {
     public static final DotName DECLARE_ROLES = DotName.createSimple(DeclareRoles.class.getName());
     public static final DotName MULTIPART_CONFIG = DotName.createSimple(MultipartConfig.class.getName());
     public static final DotName SERVLET_SECURITY = DotName.createSimple(ServletSecurity.class.getName());
-    public static final String WEB_XML = "META-INF/web.xml";
+    protected static final String SERVLET_CONTAINER_INITIALIZER = "META-INF/services/javax.servlet.ServletContainerInitializer";
+    protected static final DotName HANDLES_TYPES = DotName.createSimple(HandlesTypes.class.getName());
 
     @Inject
     CombinedIndexBuildItem combinedIndexBuildItem;
-
-    /**
-     * Configuration which applies to the HTTP server.
-     */
-    @ConfigItem(name = "http")
-    HttpConfig config;
 
     @BuildStep
     @Record(RUNTIME_INIT)
@@ -148,17 +150,40 @@ public class UndertowBuildStep {
             List<HttpHandlerWrapperBuildItem> wrappers,
             ShutdownContextBuildItem shutdown,
             Consumer<UndertowBuildItem> undertowProducer,
-            LaunchModeBuildItem launchMode) throws Exception {
-        RuntimeValue<Undertow> ut = template.startUndertow(shutdown, servletDeploymentManagerBuildItem.getDeploymentManager(),
+            LaunchModeBuildItem launchMode,
+            ExecutorBuildItem executorBuildItem,
+            CORSTemplate corsTemplate,
+            HttpConfig config) throws Exception {
+        corsTemplate.setHttpConfig(config);
+        RuntimeValue<Undertow> ut = template.startUndertow(shutdown, executorBuildItem.getExecutorProxy(),
+                servletDeploymentManagerBuildItem.getDeploymentManager(),
                 config, wrappers.stream().map(HttpHandlerWrapperBuildItem::getValue).collect(Collectors.toList()),
                 launchMode.getLaunchMode());
         undertowProducer.accept(new UndertowBuildItem(ut));
         return new ServiceStartBuildItem("undertow");
     }
 
+    @BuildStep()
+    @Record(STATIC_INIT)
+    public void buildCorsFilter(CORSTemplate corsTemplate, HttpBuildConfig buildConfig,
+            BuildProducer<ServletExtensionBuildItem> extensionProducer) {
+        if (buildConfig.corsEnabled) {
+            extensionProducer.produce(new ServletExtensionBuildItem(corsTemplate.buildCORSExtension()));
+        }
+    }
+
     @BuildStep
-    AdditionalBeanBuildItem httpProducers() {
-        return new AdditionalBeanBuildItem(ServletProducer.class);
+    void integrateCdi(BuildProducer<AdditionalBeanBuildItem> additionalBeans,
+            BuildProducer<ContextRegistrarBuildItem> contextRegistrars,
+            BuildProducer<ListenerBuildItem> listeners) {
+        additionalBeans.produce(new AdditionalBeanBuildItem(ServletProducer.class));
+        contextRegistrars.produce(new ContextRegistrarBuildItem(new ContextRegistrar() {
+            @Override
+            public void register(RegistrationContext registrationContext) {
+                registrationContext.configure(SessionScoped.class).normal().contextClass(HttpSessionContext.class).done();
+            }
+        }));
+        listeners.produce(new ListenerBuildItem(HttpSessionContext.class.getName()));
     }
 
     @BuildStep
@@ -166,61 +191,89 @@ public class UndertowBuildStep {
         return SubstrateConfigBuildItem.builder()
                 .addRuntimeInitializedClass("io.undertow.server.protocol.ajp.AjpServerResponseConduit")
                 .addRuntimeInitializedClass("io.undertow.server.protocol.ajp.AjpServerRequestConduit")
-
                 .build();
     }
 
     @BuildStep
-    HotDeploymentConfigFileBuildItem configFile() {
-        return new HotDeploymentConfigFileBuildItem(WEB_XML);
+    void runtimeReinit(BuildProducer<RuntimeReinitializedClassBuildItem> producer) {
+        producer.produce(new RuntimeReinitializedClassBuildItem("org.wildfly.common.net.HostName"));
+        producer.produce(new RuntimeReinitializedClassBuildItem("org.wildfly.common.os.Process"));
     }
 
     @BuildStep
-    WebMetadataBuildItem createWebMetadata(ApplicationArchivesBuildItem applicationArchivesBuildItem,
-            Consumer<AdditionalBeanBuildItem> additionalBeanBuildItemConsumer) throws Exception {
+    public void kubernetes(HttpConfig config, BuildProducer<KubernetesPortBuildItem> portProducer) {
+        portProducer.produce(new KubernetesPortBuildItem(config.port, "http"));
+    }
 
-        WebMetaData result;
-        Path webXml = applicationArchivesBuildItem.getRootArchive().getChildPath(WEB_XML);
-        if (webXml != null) {
-            Set<String> additionalBeans = new HashSet<>();
+    /**
+     * Register the undertow-handlers.conf file
+     */
+    @BuildStep
+    @Record(STATIC_INIT)
+    public void registerUndertowHandlersConf(BuildProducer<ServletExtensionBuildItem> producer,
+            ApplicationArchivesBuildItem applicationArchivesBuildItem,
+            BuildProducer<HotDeploymentWatchedFileBuildItem> watchedFile,
+            BuildProducer<SubstrateResourceBuildItem> substrateResourceBuildItemBuildProducer) {
+        //we always watch the file, so if it gets added we restart
+        watchedFile.produce(
+                new HotDeploymentWatchedFileBuildItem(UndertowHandlersConfServletExtension.META_INF_UNDERTOW_HANDLERS_CONF));
 
-            final XMLInputFactory inputFactory = XMLInputFactory.newInstance();
-            MetaDataElementParser.DTDInfo dtdInfo = new MetaDataElementParser.DTDInfo();
-            inputFactory.setXMLResolver(dtdInfo);
-            try (FileInputStream in = new FileInputStream(webXml.toFile())) {
-                final XMLStreamReader xmlReader = inputFactory.createXMLStreamReader(in);
-                result = WebMetaDataParser.parse(xmlReader, dtdInfo, PropertyReplacers.noop());
-            }
-            if (result.getServlets() != null) {
-                for (ServletMetaData i : result.getServlets()) {
-                    additionalBeans.add(i.getServletClass());
-                }
-            }
-            if (result.getFilters() != null) {
-                for (FilterMetaData i : result.getFilters()) {
-                    additionalBeans.add(i.getFilterClass());
-                }
-            }
-            if (result.getListeners() != null) {
-                for (ListenerMetaData i : result.getListeners()) {
-                    additionalBeans.add(i.getListenerClass());
-                }
-            }
-            additionalBeanBuildItemConsumer
-                    .accept(new AdditionalBeanBuildItem(false, additionalBeans.toArray(new String[additionalBeans.size()])));
-        } else {
-            result = new WebMetaData();
+        //check for the file in the handlers dir
+        Path handlerPath = applicationArchivesBuildItem.getRootArchive()
+                .getChildPath(UndertowHandlersConfServletExtension.META_INF_UNDERTOW_HANDLERS_CONF);
+        if (handlerPath != null) {
+            producer.produce(new ServletExtensionBuildItem(new UndertowHandlersConfServletExtension()));
+            substrateResourceBuildItemBuildProducer.produce(
+                    new SubstrateResourceBuildItem(UndertowHandlersConfServletExtension.META_INF_UNDERTOW_HANDLERS_CONF));
         }
-        return new WebMetadataBuildItem(result);
+    }
+
+    /*
+     * look for Servlet container initializers
+     *
+     */
+    @BuildStep
+    public List<ServletContainerInitializerBuildItem> servletContainerInitializer(
+            ApplicationArchivesBuildItem archives,
+            CombinedIndexBuildItem combinedIndexBuildItem,
+            BuildProducer<AdditionalBeanBuildItem> beans) throws IOException {
+        List<ServletContainerInitializerBuildItem> ret = new ArrayList<>();
+        Set<String> initializers = ServiceUtil.classNamesNamedIn(Thread.currentThread().getContextClassLoader(),
+                SERVLET_CONTAINER_INITIALIZER);
+        for (String initializer : initializers) {
+            beans.produce(AdditionalBeanBuildItem.unremovableOf(initializer));
+            ClassInfo sci = combinedIndexBuildItem.getIndex().getClassByName(DotName.createSimple(initializer));
+            if (sci != null) {
+                AnnotationInstance handles = sci.classAnnotation(HANDLES_TYPES);
+                Set<String> handledTypes = new HashSet<>();
+                if (handles != null) {
+                    Type[] types = handles.value().asClassArray();
+                    for (Type handledType : types) {
+                        DotName typeName = handledType.asClassType().name();
+                        for (ClassInfo classInfo : combinedIndexBuildItem.getIndex().getAllKnownSubclasses(typeName)) {
+                            handledTypes.add(classInfo.name().toString());
+                        }
+                        for (ClassInfo classInfo : combinedIndexBuildItem.getIndex().getAllKnownImplementors(typeName)) {
+                            handledTypes.add(classInfo.name().toString());
+                        }
+                    }
+                }
+                ret.add(new ServletContainerInitializerBuildItem(initializer, handledTypes));
+            } else {
+                ret.add(new ServletContainerInitializerBuildItem(initializer, Collections.emptySet()));
+            }
+        }
+        return ret;
     }
 
     @Record(STATIC_INIT)
     @BuildStep()
-    public ServletDeploymentManagerBuildItem build(ApplicationArchivesBuildItem applicationArchivesBuildItem,
-            List<ServletBuildItem> servlets,
+    public ServletDeploymentManagerBuildItem build(List<ServletBuildItem> servlets,
             List<FilterBuildItem> filters,
+            List<ListenerBuildItem> listeners,
             List<ServletInitParamBuildItem> initParams,
             List<ServletContextAttributeBuildItem> contextParams,
+            List<ServletContainerInitializerBuildItem> servletContainerInitializerBuildItems,
             UndertowDeploymentTemplate template, RecorderContext context,
             List<ServletExtensionBuildItem> extensions,
             BeanContainerBuildItem bc,
@@ -228,7 +281,8 @@ public class UndertowBuildStep {
             BuildProducer<ObjectSubstitutionBuildItem> substitutions,
             Consumer<ReflectiveClassBuildItem> reflectiveClasses,
             LaunchModeBuildItem launchMode,
-            ShutdownContextBuildItem shutdownContext) throws Exception {
+            ShutdownContextBuildItem shutdownContext,
+            KnownPathsBuildItem knownPaths) throws Exception {
 
         ObjectSubstitutionBuildItem.Holder holder = new ObjectSubstitutionBuildItem.Holder(ServletSecurityInfo.class,
                 ServletSecurityInfoProxy.class, ServletSecurityInfoSubstitution.class);
@@ -236,32 +290,8 @@ public class UndertowBuildStep {
         reflectiveClasses.accept(new ReflectiveClassBuildItem(false, false, DefaultServlet.class.getName(),
                 "io.undertow.server.protocol.http.HttpRequestParser$$generated"));
 
-        //we need to check for web resources in order to get welcome files to work
-        //this kinda sucks
-        Set<String> knownFiles = new HashSet<>();
-        Set<String> knownDirectories = new HashSet<>();
-        for (ApplicationArchive i : applicationArchivesBuildItem.getAllApplicationArchives()) {
-            Path resource = i.getChildPath("META-INF/resources");
-            if (resource != null && Files.exists(resource)) {
-                Files.walk(resource).forEach(new Consumer<Path>() {
-                    @Override
-                    public void accept(Path path) {
-                        // Skip META-INF/resources entry
-                        if (resource.equals(path)) {
-                            return;
-                        }
-                        Path rel = resource.relativize(path);
-                        if (Files.isDirectory(rel)) {
-                            knownDirectories.add(rel.toString());
-                        } else {
-                            knownFiles.add(rel.toString());
-                        }
-                    }
-                });
-            }
-        }
-
-        RuntimeValue<DeploymentInfo> deployment = template.createDeployment("test", knownFiles, knownDirectories,
+        RuntimeValue<DeploymentInfo> deployment = template.createDeployment("test", knownPaths.knownFiles,
+                knownPaths.knownDirectories,
                 launchMode.getLaunchMode(), shutdownContext);
 
         WebMetaData webMetaData = webMetadataBuildItem.getWebMetaData();
@@ -408,7 +438,7 @@ public class UndertowBuildStep {
             }
         }
         for (ServletInitParamBuildItem i : initParams) {
-            template.addServltInitParameter(deployment, i.getKey(), i.getValue());
+            template.addServletInitParameter(deployment, i.getKey(), i.getValue());
         }
         for (ServletContextAttributeBuildItem i : contextParams) {
             template.addServletContextAttribute(deployment, i.getKey(), i.getValue());
@@ -416,26 +446,24 @@ public class UndertowBuildStep {
         for (ServletExtensionBuildItem i : extensions) {
             template.addServletExtension(deployment, i.getValue());
         }
-        return new ServletDeploymentManagerBuildItem(template.bootServletContainer(deployment, bc.getValue()));
-
-    }
-
-    @BuildStep
-    SubstrateResourceBuildItem registerSubstrateResources(ArchiveRootBuildItem root,
-            ApplicationArchivesBuildItem applicationArchivesBuildItem) throws IOException {
-        List<String> res = new ArrayList<>();
-        Path resources = applicationArchivesBuildItem.getRootArchive().getChildPath("META-INF/resources");
-        if (resources != null) {
-            Files.walk(resources).forEach(new Consumer<Path>() {
-                @Override
-                public void accept(Path path) {
-                    if (!Files.isDirectory(path)) {
-                        res.add(root.getPath().relativize(path).toString());
-                    }
-                }
-            });
+        for (ListenerBuildItem i : listeners) {
+            reflectiveClasses.accept(new ReflectiveClassBuildItem(false, false, i.getListenerClass()));
+            template.registerListener(deployment, context.classProxy(i.getListenerClass()), bc.getValue());
         }
-        return new SubstrateResourceBuildItem(res);
+
+        for (ServletContainerInitializerBuildItem sci : servletContainerInitializerBuildItems) {
+            Set<Class<?>> handlesTypes = new HashSet<>();
+            for (String handledType : sci.handlesTypes) {
+                handlesTypes.add(context.classProxy(handledType));
+            }
+
+            template.addServletContainerInitializer(deployment,
+                    (Class<? extends ServletContainerInitializer>) context.classProxy(sci.sciClass), handlesTypes);
+        }
+
+        return new ServletDeploymentManagerBuildItem(
+                template.bootServletContainer(deployment, bc.getValue(), launchMode.getLaunchMode()));
+
     }
 
     /**

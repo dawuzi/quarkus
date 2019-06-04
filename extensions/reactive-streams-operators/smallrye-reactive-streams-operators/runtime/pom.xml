@@ -25,7 +25,7 @@
     </parent>
     <modelVersion>4.0.0</modelVersion>
 
-    <artifactId>quarkus-smallrye-reactive-streams-operators-runtime</artifactId>
+    <artifactId>quarkus-smallrye-reactive-streams-operators</artifactId>
     <name>Quarkus - SmallRye Reactive Streams Operators - Runtime</name>
 
     <dependencies>
@@ -41,13 +41,21 @@
             <groupId>io.smallrye.reactive</groupId>
             <artifactId>smallrye-reactive-streams-operators</artifactId>
         </dependency>
+        <dependency>
+            <groupId>io.smallrye</groupId>
+            <artifactId>smallrye-context-propagation-propagators-rxjava2</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-smallrye-context-propagation</artifactId>
+        </dependency>
     </dependencies>
 
     <build>
-        <!-- Mark this as a runtime dependency, so to make sure it's included on the final classpath during native-image -->
         <plugins>
             <plugin>
-                <artifactId>maven-dependency-plugin</artifactId>
+                <groupId>io.quarkus</groupId>
+                <artifactId>quarkus-bootstrap-maven-plugin</artifactId>
             </plugin>
             <plugin>
                 <artifactId>maven-compiler-plugin</artifactId>

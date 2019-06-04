@@ -22,6 +22,10 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.function.Consumer;
 
 import org.junit.Assert;
@@ -82,11 +86,98 @@ public class BytecodeRecorderTestCase {
     }
 
     @Test
+    public void testEmptyCollections() throws Exception {
+        runTest(recorder -> {
+            TestTemplate template = recorder.getRecordingProxy(TestTemplate.class);
+            template.object(Collections.emptyList());
+        }, new ArrayList<>());
+        runTest(recorder -> {
+            TestTemplate template = recorder.getRecordingProxy(TestTemplate.class);
+            template.object(Collections.emptyMap());
+        }, new HashMap<>());
+        runTest(recorder -> {
+            TestTemplate template = recorder.getRecordingProxy(TestTemplate.class);
+            template.object(Collections.emptySet());
+        }, new HashSet<>());
+        runTest(recorder -> {
+            TestTemplate template = recorder.getRecordingProxy(TestTemplate.class);
+            template.object(Collections.emptyNavigableMap());
+        }, new LinkedHashMap<>());
+        runTest(recorder -> {
+            TestTemplate template = recorder.getRecordingProxy(TestTemplate.class);
+            template.object(Collections.emptySortedMap());
+        }, new TreeMap<>());
+        runTest(recorder -> {
+            TestTemplate template = recorder.getRecordingProxy(TestTemplate.class);
+            template.object(Collections.emptySortedSet());
+        }, new TreeSet<>());
+    }
+
+    @Test
+    public void testSingletonCollections() throws Exception {
+        runTest(recorder -> {
+            TestTemplate template = recorder.getRecordingProxy(TestTemplate.class);
+            template.object(Collections.singletonList(1));
+        }, new ArrayList<>(Arrays.asList(1)));
+        runTest(recorder -> {
+            TestTemplate template = recorder.getRecordingProxy(TestTemplate.class);
+            template.object(Collections.singletonMap(1, 2));
+        }, new HashMap<>(Collections.singletonMap(1, 2)));
+        runTest(recorder -> {
+            TestTemplate template = recorder.getRecordingProxy(TestTemplate.class);
+            template.object(Collections.singleton(1));
+        }, new HashSet<>(Collections.singleton(1)));
+    }
+
+    @Test
     public void testJavaBean() throws Exception {
         runTest(recorder -> {
             TestTemplate template = recorder.getRecordingProxy(TestTemplate.class);
             template.bean(new TestJavaBean("A string", 99));
         }, new TestJavaBean("A string", 99));
+    }
+
+    @Test
+    public void testLargeCollection() throws Exception {
+
+        List<TestJavaBean> beans = new ArrayList<>();
+        for (int i = 0; i < 10000; ++i) {
+            beans.add(new TestJavaBean("A string", 99));
+        }
+
+        runTest(recorder -> {
+            TestTemplate template = recorder.getRecordingProxy(TestTemplate.class);
+            template.list(beans);
+        }, beans);
+    }
+
+    @Test
+    public void testLargeArray() throws Exception {
+
+        List<TestJavaBean> beans = new ArrayList<>();
+        for (int i = 0; i < 1000; ++i) {
+            beans.add(new TestJavaBean("A string", 99));
+        }
+
+        runTest(recorder -> {
+            TestTemplate template = recorder.getRecordingProxy(TestTemplate.class);
+            template.array(beans.toArray());
+        }, (Object) beans.toArray());
+    }
+
+    @Test
+    public void testLargeNumberOfInvocations() throws Exception {
+        List<TestJavaBean> beans = new ArrayList<>();
+        for (int i = 0; i < 10000; ++i) {
+            beans.add(new TestJavaBean("A string", 99));
+        }
+
+        runTest(recorder -> {
+            TestTemplate template = recorder.getRecordingProxy(TestTemplate.class);
+            for (TestJavaBean i : beans) {
+                template.bean(i);
+            }
+        }, beans.toArray());
     }
 
     @Test
@@ -110,6 +201,15 @@ public class BytecodeRecorderTestCase {
         }, new TestJavaBean(null, 2));
     }
 
+    @Test
+    public void testRecordingProxyToStringNotNull() {
+        TestClassLoader tcl = new TestClassLoader(getClass().getClassLoader());
+        BytecodeRecorderImpl recorder = new BytecodeRecorderImpl(tcl, false, TEST_CLASS);
+        TestTemplate template = recorder.getRecordingProxy(TestTemplate.class);
+        Assert.assertNotNull(template.toString());
+        Assert.assertTrue(template.toString().contains("$$RecordingProxyProxy"));
+    }
+
     void runTest(Consumer<BytecodeRecorderImpl> generator, Object... expected) throws Exception {
         TestTemplate.RESULT.clear();
         TestClassLoader tcl = new TestClassLoader(getClass().getClassLoader());
@@ -126,6 +226,8 @@ public class BytecodeRecorderTestCase {
                     Assert.assertArrayEquals((int[]) i, (int[]) TestTemplate.RESULT.poll());
                 } else if (i instanceof double[]) {
                     Assert.assertArrayEquals((double[]) i, (double[]) TestTemplate.RESULT.poll(), 0);
+                } else if (i instanceof Object[]) {
+                    Assert.assertArrayEquals((Object[]) i, (Object[]) TestTemplate.RESULT.poll());
                 } else {
                     throw new RuntimeException("not implemented");
                 }

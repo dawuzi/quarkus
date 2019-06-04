@@ -16,7 +16,10 @@
 
 package io.quarkus.elytron.security.deployment;
 
+import java.security.Provider;
+import java.security.Security;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 
@@ -24,6 +27,8 @@ import org.jboss.logging.Logger;
 import org.wildfly.security.auth.server.SecurityDomain;
 import org.wildfly.security.auth.server.SecurityRealm;
 
+import io.quarkus.arc.deployment.AdditionalBeanBuildItem;
+import io.quarkus.arc.deployment.BeanContainerBuildItem;
 import io.quarkus.deployment.QuarkusConfig;
 import io.quarkus.deployment.annotations.BuildProducer;
 import io.quarkus.deployment.annotations.BuildStep;
@@ -36,6 +41,7 @@ import io.quarkus.elytron.security.runtime.AuthConfig;
 import io.quarkus.elytron.security.runtime.MPRealmConfig;
 import io.quarkus.elytron.security.runtime.PropertiesRealmConfig;
 import io.quarkus.elytron.security.runtime.SecurityConfig;
+import io.quarkus.elytron.security.runtime.SecurityContextPrincipal;
 import io.quarkus.elytron.security.runtime.SecurityTemplate;
 import io.quarkus.runtime.RuntimeValue;
 import io.quarkus.undertow.deployment.ServletExtensionBuildItem;
@@ -56,7 +62,6 @@ import io.undertow.servlet.ServletExtension;
  * TODO: The handling of the configuration to SecurityRealm instance creation/loading is clumsy to not being able to
  * have a config object annotated with @ConfigGroup inherit from another object with MP config annotated properties.
  *
- * TODO: What additional features would be needed for Keycloak adaptor integration
  */
 class SecurityDeploymentProcessor {
     private static final Logger log = Logger.getLogger(SecurityDeploymentProcessor.class.getName());
@@ -77,15 +82,30 @@ class SecurityDeploymentProcessor {
         return new FeatureBuildItem(FeatureBuildItem.SECURITY);
     }
 
+    @BuildStep
+    AdditionalBeanBuildItem registerAdditionalBeans() {
+        return AdditionalBeanBuildItem.unremovableOf(SecurityContextPrincipal.class);
+    }
+
     /**
      * Register the Elytron-provided password factory SPI implementation
      *
      * @param classes producer factory for ReflectiveClassBuildItems
      */
     @BuildStep
-    void services(BuildProducer<ReflectiveClassBuildItem> classes) {
-        classes.produce(
-                new ReflectiveClassBuildItem(false, false, "org.wildfly.security.password.impl.PasswordFactorySpiImpl"));
+    void services(BuildProducer<ReflectiveClassBuildItem> classes, BuildProducer<JCAProviderBuildItem> jcaProviders) {
+        String[] allClasses = {
+                "org.wildfly.security.password.impl.PasswordFactorySpiImpl",
+        };
+        classes.produce(new ReflectiveClassBuildItem(true, false, allClasses));
+
+        // Create JCAProviderBuildItems for any configured provider names
+        if (security.securityProviders != null) {
+            for (String providerName : security.securityProviders) {
+                jcaProviders.produce(new JCAProviderBuildItem(providerName));
+                log.debugf("Added providerName: %s", providerName);
+            }
+        }
     }
 
     /**
@@ -251,14 +271,79 @@ class SecurityDeploymentProcessor {
         // Create the configured identity manager
         IdentityManagerBuildItem identityManager = identityManagers.get(0);
         // Collect all of the authentication mechanisms and create a ServletExtension to register the Undertow identity manager
-        ArrayList<AuthConfig> allAuthConfigs = new ArrayList<>();
+        ServletExtension idmExt = template.configureUndertowIdentityManager(securityDomain.getSecurityDomain(),
+                identityManager.getIdentityManager());
+        extension.produce(new ServletExtensionBuildItem(idmExt));
+    }
+
+    /**
+     * Produces a {@code ServletExtension} to configure Undertow {@code AuthConfigBuildItem} produced during the build
+     *
+     * @param template - the runtime template class used to access runtime behaviors
+     * @param extension - the ServletExtensionBuildItem producer used to add the Undertow auth config
+     * @param authConfigs - the authentication method information that has been registered
+     */
+    @BuildStep
+    @Record(ExecutionTime.STATIC_INIT)
+    void addLoginConfig(SecurityTemplate template, List<AuthConfigBuildItem> authConfigs,
+            BuildProducer<ServletExtensionBuildItem> extension) {
+        List<AuthConfig> allAuthConfigs = new ArrayList<>();
+
         for (AuthConfigBuildItem authConfigExt : authConfigs) {
             AuthConfig ac = authConfigExt.getAuthConfig();
             allAuthConfigs.add(ac);
         }
-        ServletExtension idmExt = template.configureUndertowIdentityManager(securityDomain.getSecurityDomain(),
-                identityManager.getIdentityManager(), allAuthConfigs);
-        extension.produce(new ServletExtensionBuildItem(idmExt));
+
+        extension.produce(new ServletExtensionBuildItem(template.configureLoginConfig(allAuthConfigs)));
+    }
+
+    @BuildStep
+    @Record(ExecutionTime.STATIC_INIT)
+    ServletExtensionBuildItem addSecurityContextPrincipalHandler(SecurityTemplate template, BeanContainerBuildItem container) {
+        log.debugf("addSecurityContextPrincipalHandler");
+        return new ServletExtensionBuildItem(template.configureSecurityContextPrincipalHandler(container.getValue()));
+    }
+
+    /**
+     * Register the classes for reflection in the requested named providers
+     * 
+     * @param classes - ReflectiveClassBuildItem producer
+     * @param jcaProviders - JCAProviderBuildItem for requested providers
+     */
+    @BuildStep
+    @Record(ExecutionTime.STATIC_INIT)
+    void registerJCAProviders(BuildProducer<ReflectiveClassBuildItem> classes, List<JCAProviderBuildItem> jcaProviders) {
+        for (JCAProviderBuildItem provider : jcaProviders) {
+            List<String> providerClasses = registerProvider(provider.getProviderName());
+            for (String className : providerClasses) {
+                classes.produce(new ReflectiveClassBuildItem(true, true, className));
+                log.debugf("Register JCA class: %s", className);
+            }
+        }
+    }
+
+    /**
+     * Determine the classes that make up the provider and its services
+     * 
+     * @param providerName - JCA provider name
+     * @return class names that make up the provider and its services
+     */
+    private List<String> registerProvider(String providerName) {
+        ArrayList<String> providerClasses = new ArrayList<>();
+        Provider provider = Security.getProvider(providerName);
+        providerClasses.add(provider.getClass().getName());
+        Set<Provider.Service> services = provider.getServices();
+        for (Provider.Service service : services) {
+            String serviceClass = service.getClassName();
+            providerClasses.add(serviceClass);
+            // Need to pull in the key classes
+            String supportedKeyClasses = service.getAttribute("SupportedKeyClasses");
+            if (supportedKeyClasses != null) {
+                String[] keyClasses = supportedKeyClasses.split("\\|");
+                providerClasses.addAll(Arrays.asList(keyClasses));
+            }
+        }
+        return providerClasses;
     }
 
     /**

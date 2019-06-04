@@ -21,12 +21,12 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Set;
-
+import javax.enterprise.event.Reception;
 import javax.enterprise.inject.spi.DefinitionException;
 import javax.enterprise.inject.spi.ObserverMethod;
-
 import org.jboss.jandex.AnnotationInstance;
 import org.jboss.jandex.AnnotationTarget.Kind;
+import org.jboss.jandex.AnnotationValue;
 import org.jboss.jandex.MethodInfo;
 import org.jboss.jandex.MethodParameterInfo;
 import org.jboss.jandex.Type;
@@ -36,7 +36,7 @@ import org.jboss.jandex.Type;
  *
  * @author Martin Kouba
  */
-public class ObserverInfo {
+public class ObserverInfo implements InjectionTargetInfo {
 
     private final BeanInfo declaringBean;
 
@@ -67,6 +67,16 @@ public class ObserverInfo {
         this.isAsync = isAsync;
     }
 
+    @Override
+    public TargetKind kind() {
+        return TargetKind.OBSERVER;
+    }
+
+    @Override
+    public ObserverInfo asObserver() {
+        return this;
+    }
+
     public BeanInfo getDeclaringBean() {
         return declaringBean;
     }
@@ -91,9 +101,20 @@ public class ObserverInfo {
         return isAsync;
     }
 
+    public Reception getReception() {
+        AnnotationInstance observesAnnotation = isAsync
+                ? declaringBean.getDeployment().getAnnotation(observerMethod, DotNames.OBSERVES_ASYNC)
+                : declaringBean.getDeployment().getAnnotation(observerMethod, DotNames.OBSERVES);
+        AnnotationValue receptionValue = observesAnnotation.value("notifyObserver");
+        if (receptionValue == null) {
+            return Reception.ALWAYS;
+        }
+        return Reception.valueOf(receptionValue.asEnum());
+    }
+
     void init(List<Throwable> errors) {
         for (InjectionPointInfo injectionPoint : injection.injectionPoints) {
-            Beans.resolveInjectionPoint(declaringBean.getDeployment(), getDeclaringBean(), injectionPoint, errors);
+            Beans.resolveInjectionPoint(declaringBean.getDeployment(), this, injectionPoint, errors);
         }
     }
 
@@ -104,7 +125,8 @@ public class ObserverInfo {
     public Set<AnnotationInstance> getQualifiers() {
         Set<AnnotationInstance> qualifiers = new HashSet<>();
         for (AnnotationInstance annotation : declaringBean.getDeployment().getAnnotations(observerMethod)) {
-            if (annotation.target().equals(eventParameter) && declaringBean.getDeployment().getQualifier(annotation.name()) != null) {
+            if (annotation.target().equals(eventParameter)
+                    && declaringBean.getDeployment().getQualifier(annotation.name()) != null) {
                 qualifiers.add(annotation);
             }
         }

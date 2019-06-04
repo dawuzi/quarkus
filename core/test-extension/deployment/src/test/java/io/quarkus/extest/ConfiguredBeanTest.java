@@ -1,5 +1,17 @@
 package io.quarkus.extest;
 
+import static org.hamcrest.Matchers.is;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
 import javax.inject.Inject;
 
 import org.jboss.shrinkwrap.api.ShrinkWrap;
@@ -9,12 +21,13 @@ import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
-import io.quarkus.extest.runtime.NestedConfig;
-import io.quarkus.extest.runtime.ObjectOfValue;
-import io.quarkus.extest.runtime.ObjectValueOf;
-import io.quarkus.extest.runtime.TestBuildAndRunTimeConfig;
-import io.quarkus.extest.runtime.TestRunTimeConfig;
+import io.quarkus.extest.runtime.config.NestedConfig;
+import io.quarkus.extest.runtime.config.ObjectOfValue;
+import io.quarkus.extest.runtime.config.ObjectValueOf;
+import io.quarkus.extest.runtime.config.TestBuildAndRunTimeConfig;
+import io.quarkus.extest.runtime.config.TestRunTimeConfig;
 import io.quarkus.test.QuarkusUnitTest;
+import io.restassured.RestAssured;
 
 /**
  * Test driver for the test-extension
@@ -24,7 +37,7 @@ public class ConfiguredBeanTest {
     static final QuarkusUnitTest config = new QuarkusUnitTest()
             .setArchiveProducer(() -> ShrinkWrap.create(JavaArchive.class)
                     .addClasses(ConfiguredBean.class)
-                    .addAsManifestResource("microprofile-config.properties"));
+                    .addAsResource("application.properties"));
 
     @Inject
     ConfiguredBean configuredBean;
@@ -34,7 +47,7 @@ public class ConfiguredBeanTest {
      */
     @Test
     public void validateConfiguredBean() {
-        System.out.printf("validateConfiguredBean, %s\n", configuredBean);
+        System.out.printf("validateConfiguredBean, %s%n", configuredBean);
         Assertions.assertNotNull(configuredBean);
         Assertions.assertNotNull(configuredBean.getBuildTimeConfig());
         Assertions.assertNotNull(configuredBean.getRunTimeConfig());
@@ -42,10 +55,10 @@ public class ConfiguredBeanTest {
 
     /**
      * Validate that the TestBuildAndRunTimeConfig is the same as seen at build time
-     * Currently disabled due to https://github.com/jbossas/quarkus/issues/962
+     * Currently disabled due to https://github.com/quarkusio/quarkus/issues/962
      */
     @Test
-    @Disabled("https://github.com/jbossas/quarkus/issues/962")
+    @Disabled("https://github.com/quarkusio/quarkus/issues/962")
     public void validateBuildTimeConfig() {
         TestBuildAndRunTimeConfig buildTimeConfig = configuredBean.getBuildTimeConfig();
         Assertions.assertEquals("StringBasedValue", buildTimeConfig.btSBV.getValue(),
@@ -100,6 +113,8 @@ public class ConfiguredBeanTest {
             throw new IllegalStateException(
                     "buildTimeConfig.allValues.simpleMap.size != 2; " + buildTimeConfig.allValues.nestedConfigMap.size());
         }
+        Assertions.assertNotEquals("${java.vm.version}", buildTimeConfig.allValues.expandedDefault);
+        Assertions.assertFalse(buildTimeConfig.allValues.expandedDefault.isEmpty());
     }
 
     /**
@@ -144,13 +159,14 @@ public class ConfiguredBeanTest {
         Assertions.assertEquals(1, runTimeConfig.allValues.longList.get(0).longValue());
         Assertions.assertEquals(2, runTimeConfig.allValues.longList.get(1).longValue());
         Assertions.assertEquals(3, runTimeConfig.allValues.longList.get(2).longValue());
+        Assertions.assertNotEquals("${java.vm.version}", runTimeConfig.allValues.expandedDefault);
+        Assertions.assertFalse(runTimeConfig.allValues.expandedDefault.isEmpty());
     }
 
     /**
      * Break out the validation of the RUN_TIME config nested map as that currently is not working.
      */
     @Test
-    @Disabled("https://github.com/jbossas/quarkus/issues/956")
     public void validateRuntimeConfigMap() {
         TestRunTimeConfig runTimeConfig = configuredBean.getRunTimeConfig();
         Assertions.assertEquals(2, runTimeConfig.allValues.nestedConfigMap.size());
@@ -166,5 +182,46 @@ public class ConfiguredBeanTest {
         Assertions.assertNotNull(nc2);
         Assertions.assertEquals("value2", nc2.nestedValue);
         Assertions.assertEquals(new ObjectOfValue("value2.1", "value2.2"), nc2.oov);
+        //quarkus.rt.all-values.string-map.key1=value1
+        //quarkus.rt.all-values.string-map.key2=value2
+        //quarkus.rt.all-values.string-map.key3=value3
+        final Map<String, String> stringMap = runTimeConfig.allValues.stringMap;
+        Assertions.assertEquals("value1", stringMap.get("key1"));
+        Assertions.assertEquals("value2", stringMap.get("key2"));
+        Assertions.assertEquals("value3", stringMap.get("key3"));
+        //quarkus.rt.all-values.string-list-map.key1=value1,value2,value3
+        //quarkus.rt.all-values.string-list-map.key2=value4,value5
+        //quarkus.rt.all-values.string-list-map.key3=value6
+        final Map<String, List<String>> stringListMap = runTimeConfig.allValues.stringListMap;
+        Assertions.assertEquals(Arrays.asList("value1", "value2", "value3"), stringListMap.get("key1"));
+        Assertions.assertEquals(Arrays.asList("value4", "value5"), stringListMap.get("key2"));
+        Assertions.assertEquals(Collections.singletonList("value6"), stringListMap.get("key3"));
     }
+
+    /**
+     * Test the RuntimeXmlConfigService using old school sockets
+     */
+    @Test
+    public void testRuntimeXmlConfigService() throws Exception {
+        // From config.xml
+        Socket socket = new Socket("localhost", 12345);
+        OutputStream os = socket.getOutputStream();
+        os.write("testRuntimeXmlConfigService\n".getBytes("UTF-8"));
+        os.flush();
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+            String reply = reader.readLine();
+            Assertions.assertEquals("testRuntimeXmlConfigService-ack", reply);
+        } finally {
+            os.close();
+            socket.close();
+        }
+    }
+
+    @Test
+    public void verifyCommandServlet() {
+        RestAssured.when().get("/commands/ping").then()
+                .body(is("/ping-ack"));
+    }
+
 }
